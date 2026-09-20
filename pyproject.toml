@@ -1,0 +1,35 @@
+[build-system]
+requires = ["maturin>=1.11,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "aws-why"
+dynamic = ["version"]
+description = "Run AWS CLI commands and explain authorization failures with evidence"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+keywords = ["aws", "iam", "cli", "security", "authorization"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Intended Audience :: System Administrators",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Rust",
+  "Topic :: Security",
+  "Topic :: System :: Systems Administration",
+]
+
+[project.urls]
+Documentation = "https://github.com/kraftaa/aws-why#readme"
+Issues = "https://github.com/kraftaa/aws-why/issues"
+Source = "https://github.com/kraftaa/aws-why"
+
+[tool.maturin]
+bindings = "bin"
+strip = true
+targets = [{ name = "aws-why", kind = "bin" }]
