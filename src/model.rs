@@ -1,3 +1,4 @@
+use regex::Regex;
 use serde::Serialize;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -223,11 +224,11 @@ impl AnalysisReport {
     pub fn from_parts(
         exit_code: i32,
         failure_kind: FailureKind,
-        identity: Option<AwsIdentity>,
+        mut identity: Option<AwsIdentity>,
         evidence: Option<AwsErrorEvidence>,
-        authorization: Vec<AuthorizationResult>,
-        notes: Vec<String>,
-        credential_source: Option<String>,
+        mut authorization: Vec<AuthorizationResult>,
+        mut notes: Vec<String>,
+        mut credential_source: Option<String>,
     ) -> Self {
         let result = match failure_kind {
             FailureKind::Authorization => "denied",
@@ -238,10 +239,34 @@ impl AnalysisReport {
             FailureKind::Other => "failed",
         };
         let error = evidence.as_ref().map(|item| ErrorSummary {
-            code: item.error_code.clone(),
-            message: redact_sensitive(&item.message),
-            request_id: item.request_id.clone(),
+            code: sanitize_generated_text(&item.error_code),
+            message: sanitize_generated_text(&item.message),
+            request_id: item.request_id.as_deref().map(sanitize_generated_text),
         });
+        if let Some(identity) = identity.as_mut() {
+            identity.arn = sanitize_generated_text(&identity.arn);
+            identity.role_name = identity.role_name.as_deref().map(sanitize_generated_text);
+            identity.user_name = identity.user_name.as_deref().map(sanitize_generated_text);
+            identity.session_name = identity
+                .session_name
+                .as_deref()
+                .map(sanitize_generated_text);
+        }
+        for result in &mut authorization {
+            result.action = result.action.as_deref().map(sanitize_generated_text);
+            result.resource = result.resource.as_deref().map(sanitize_generated_text);
+            result.policy = result.policy.as_deref().map(sanitize_generated_text);
+            result.missing_context = result
+                .missing_context
+                .iter()
+                .map(|value| sanitize_generated_text(value))
+                .collect();
+        }
+        notes = notes
+            .iter()
+            .map(|value| sanitize_generated_text(value))
+            .collect();
+        credential_source = credential_source.as_deref().map(sanitize_generated_text);
         Self {
             result,
             exit_code,
@@ -255,7 +280,7 @@ impl AnalysisReport {
     }
 }
 
-fn redact_sensitive(input: &str) -> String {
+fn sanitize_generated_text(input: &str) -> String {
     let mut output = input.to_owned();
     for marker in [
         "Encoded authorization failure message:",
@@ -277,18 +302,51 @@ fn redact_sensitive(input: &str) -> String {
             search_from = value_start + "[REDACTED]".len();
         }
     }
+    let patterns = [
+        (r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b", "[REDACTED_ACCESS_KEY]"),
+        (r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+", "Bearer [REDACTED]"),
+        (
+            r#"(?i)\b(?:aws_secret_access_key|secretaccesskey|sessiontoken|securitytoken|x-amz-security-token|authorization)\s*["']?\s*[:=]\s*["']?[^\s"',}]+"#,
+            "[REDACTED_CREDENTIAL]",
+        ),
+    ];
+    for (pattern, replacement) in patterns {
+        output = Regex::new(pattern)
+            .expect("valid credential regex")
+            .replace_all(&output, replacement)
+            .into_owned();
+    }
     output
+        .chars()
+        .map(|character| {
+            if character == '\n' || character == '\t' || !character.is_control() {
+                character
+            } else {
+                '\u{fffd}'
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::redact_sensitive;
+    use super::sanitize_generated_text;
 
     #[test]
     fn redacts_encoded_authorization_payloads() {
         assert_eq!(
-            redact_sensitive("Encoded authorization failure message: very-long-token"),
+            sanitize_generated_text("Encoded authorization failure message: very-long-token"),
             "Encoded authorization failure message: [REDACTED]"
         );
+    }
+
+    #[test]
+    fn redacts_common_credential_shapes_and_terminal_controls() {
+        let access_key = ["AKIA", "ABCDEFGHIJKLMNOP"].concat();
+        let input = format!("AccessKey={access_key} Authorization: Bearer secret-token\x1b[2J");
+        let output = sanitize_generated_text(&input);
+        assert!(!output.contains(&access_key));
+        assert!(!output.contains("secret-token"));
+        assert!(!output.contains('\x1b'));
     }
 }

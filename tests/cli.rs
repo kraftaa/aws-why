@@ -13,6 +13,10 @@ fn fake_aws() -> tempfile::TempDir {
 args="$*"
 case "$args" in
   *"sts get-caller-identity"*)
+    if [ "${AWS_IGNORE_CONFIGURED_ENDPOINT_URLS:-}" != "true" ]; then
+      printf 'diagnostic did not disable custom endpoints\n' >&2
+      exit 90
+    fi
     printf '%s\n' '{"UserId":"id","Account":"111111111111","Arn":"arn:aws:sts::111111111111:assumed-role/DataEngineer/example-session"}'
     exit 0
     ;;
@@ -25,6 +29,11 @@ esac
 case "${FAKE_SCENARIO:-success}" in
   success)
     printf 'command output\n'
+    exit 0
+    ;;
+  success_stderr)
+    printf 'command output\n'
+    printf 'command warning\n' >&2
     exit 0
     ;;
   boundary)
@@ -55,6 +64,14 @@ case "${FAKE_SCENARIO:-success}" in
     printf '%s\n' 'An error occurred (AccessDeniedException) when calling the GetSecretValue operation: User: arn:aws:sts::111111111111:assumed-role/DataEngineer/example-session is not authorized to perform: secretsmanager:GetSecretValue on resource: arn:aws:secretsmanager:us-east-1:222222222222:secret:prod because no identity-based policy allows the secretsmanager:GetSecretValue action' >&2
     exit 254
     ;;
+  unsigned)
+    printf '%s\n' 'An error occurred (AccessDenied) when calling the GetObject operation: not authorized to perform: s3:GetObject on resource: arn:aws:s3:::public-data/x.csv because no identity-based policy allows the s3:GetObject action' >&2
+    exit 254
+    ;;
+  encoded)
+    printf '%s\n' 'An error occurred (UnauthorizedOperation) when calling the RunInstances operation: not authorized to perform: ec2:RunInstances because no identity-based policy allows the ec2:RunInstances action. Encoded authorization failure message: SUPERSECRETENCODEDPAYLOAD' >&2
+    exit 254
+    ;;
 esac
 "#,
     )
@@ -66,6 +83,10 @@ esac
 }
 
 fn invoke(scenario: &str, json: bool) -> Output {
+    invoke_with_args(scenario, json, &[])
+}
+
+fn invoke_with_args(scenario: &str, json: bool, extra: &[&str]) -> Output {
     let directory = fake_aws();
     let aws = directory.path().join("aws");
     let mut command = Command::new(env!("CARGO_BIN_EXE_aws-why"));
@@ -73,18 +94,16 @@ fn invoke(scenario: &str, json: bool) -> Output {
     if json {
         command.arg("--json");
     }
-    command
-        .args([
-            "--",
-            aws.to_str().unwrap(),
-            "s3",
-            "cp",
-            "x.csv",
-            "s3://prod-data/x.csv",
-        ])
-        .env("FAKE_SCENARIO", scenario)
-        .output()
-        .unwrap()
+    command.args([
+        "--",
+        aws.to_str().unwrap(),
+        "s3",
+        "cp",
+        "x.csv",
+        "s3://prod-data/x.csv",
+    ]);
+    command.args(extra);
+    command.env("FAKE_SCENARIO", scenario).output().unwrap()
 }
 
 #[test]
@@ -93,6 +112,14 @@ fn successful_command_is_transparent_and_quiet() {
     assert!(output.status.success());
     assert_eq!(output.stdout, b"command output\n");
     assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn successful_json_command_replays_both_streams() {
+    let output = invoke("success_stderr", true);
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"command output\n");
+    assert_eq!(output.stderr, b"command warning\n");
 }
 
 #[test]
@@ -173,4 +200,32 @@ fn json_mode_emits_one_machine_readable_failure() {
     assert_eq!(value["authorization"][0]["action"], "s3:PutObject");
     assert_eq!(value["authorization"][0]["cause"], "permissions_boundary");
     assert_eq!(value["authorization"][0]["confidence"], "reported");
+}
+
+#[test]
+fn unsigned_command_never_triggers_credentialed_diagnostics() {
+    let output = invoke_with_args("unsigned", false, &["--no-sign-request"]);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("skipped because the command used --no-sign-request"));
+    assert!(!stderr.contains("Identity\n"));
+}
+
+#[test]
+fn custom_endpoint_command_never_triggers_follow_up_calls() {
+    let output = invoke_with_args(
+        "unsigned",
+        false,
+        &["--endpoint-url", "http://localhost:4566"],
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("skipped because the command used a custom endpoint"));
+    assert!(!stderr.contains("Identity\n"));
+}
+
+#[test]
+fn raw_encoded_authorization_payload_is_not_replayed() {
+    let output = invoke("encoded", false);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("ACCESS DENIED"));
+    assert!(!stderr.contains("SUPERSECRETENCODEDPAYLOAD"));
 }

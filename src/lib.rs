@@ -25,15 +25,32 @@ pub fn analyze(run: &CommandRun, diagnostic_timeout: Duration) -> AnalysisReport
         .and_then(model::AwsIdentity::from_arn);
     let mut diagnostic_notes = Vec::new();
 
+    if run.stderr_truncated {
+        diagnostic_notes.push(
+            "Only the final 1 MiB of command stderr was analyzed; earlier output was truncated."
+                .to_owned(),
+        );
+    }
+
     if failure_kind == FailureKind::Authorization && context.is_aws_cli() {
-        match discover_identity(&context, diagnostic_timeout) {
-            Ok(discovered) => identity = Some(discovered),
-            Err(note) => diagnostic_notes.push(note),
+        let allow_followups = context.diagnostic_block_reason().is_none();
+        if allow_followups {
+            match discover_identity(&context, diagnostic_timeout) {
+                Ok(discovered) => identity = Some(discovered),
+                Err(note) => diagnostic_notes.push(note),
+            }
+        } else if let Some(reason) = context.diagnostic_block_reason() {
+            diagnostic_notes.push(reason.to_owned());
         }
 
         if let Some(item) = evidence.as_mut() {
-            let result =
-                diagnose_authorization(&context, item, identity.as_ref(), diagnostic_timeout);
+            let result = diagnose_authorization(
+                &context,
+                item,
+                identity.as_ref(),
+                diagnostic_timeout,
+                allow_followups,
+            );
             diagnostic_notes.extend(result.notes);
             add_account_mismatch_note(
                 &mut diagnostic_notes,

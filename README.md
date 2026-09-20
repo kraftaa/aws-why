@@ -46,9 +46,9 @@ uv tool install aws-why
 
 Release wheels contain the compiled executable; Python is only the distribution mechanism. Wheels are built for macOS on Apple Silicon and Intel, Linux on ARM64 and x86-64, and Windows x86-64.
 
-The command after `--` is executed with exactly the supplied argument vector and inherited environment. `stdin` is inherited; `stdout` and `stderr` are streamed and captured. On success, `aws-why` adds no output. It returns the wrapped command's exit code.
+The command after `--` is executed with exactly the supplied argument vector and inherited environment. `stdin` is inherited and human-mode `stdout` is streamed. `stderr` is held in a secure temporary file until the result is classified. On success, `aws-why` adds no output. It returns the wrapped command's exit code.
 
-In `--json` mode, successful command output is replayed unchanged. For failures, command output is captured and replaced with one JSON diagnostic object on stdout so CI consumers can parse it reliably.
+In `--json` mode, successful command output is replayed from secure temporary files. For failures, command output is replaced with one JSON diagnostic object on stdout so CI consumers can parse it reliably. Replay is capped at 64 MiB for stdout and 8 MiB for stderr; analysis retains only the final 1 MiB of stderr.
 
 Each follow-up AWS call has a five-second timeout by default. Change it with `--diagnostic-timeout <seconds>`.
 
@@ -73,7 +73,9 @@ Simulation is never presented as proof that the live request will succeed. It ca
 
 ## AWS context and diagnostic permissions
 
-Diagnostic calls use the same process environment plus the wrapped command's explicit `--profile` and `--region`. The tool never prints environment variables, credentials, or decoded authorization payloads. Raw command errors are retained only in memory for the duration of the process.
+Diagnostic calls use the same credential environment plus the wrapped command's explicit `--profile` and `--region`, but they ignore configured custom endpoints and always use the normal AWS endpoint resolver. Follow-up calls are skipped entirely when the original command uses `--no-sign-request` or an explicit `--endpoint-url`.
+
+Generated diagnostics redact encoded authorization payloads, common AWS access-key/token formats, and terminal control characters. The wrapped command still runs with its inherited environment and can print any data it chooses—for example, `aws sts get-session-token` prints credentials by design. Do not use `aws-why` to run an untrusted executable, and protect captured CI output as you would ordinary AWS CLI output.
 
 AWS may require these permissions for stronger explanations:
 
@@ -101,4 +103,4 @@ maturin build --release --bindings bin
 
 The end-to-end tests use a temporary fake AWS executable and never contact AWS.
 
-Tagged releases build platform-specific wheels and publish them through PyPI Trusted Publishing. Before the first public release, configure this repository as a trusted publisher for the `aws-why` PyPI project with environment name `pypi`, add the eventual repository URLs to `pyproject.toml`, and push a tag matching the Cargo version, such as `v0.1.0`.
+Tagged releases build platform-specific wheels and publish them through PyPI Trusted Publishing. Before the first public release, configure this repository as a trusted publisher for the `aws-why` PyPI project with environment name `pypi`, require maintainer approval on that GitHub environment, protect release tags, and push a tag matching the Cargo version, such as `v0.1.0`. The workflow rejects tags that do not match the Cargo package version, and every third-party action is pinned to an immutable commit.

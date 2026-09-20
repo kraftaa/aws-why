@@ -8,8 +8,18 @@ permissions:
   contents: read
 
 jobs:
+  verify-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Require tag to match the package version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          test "v${version}" = "${GITHUB_REF_NAME}"
+
   wheels:
     name: Wheel ${{ matrix.target }}
+    needs: verify-tag
     strategy:
       fail-fast: false
       matrix:
@@ -28,18 +38,18 @@ jobs:
             target: x64
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Enable ARM64 container emulation
         if: runner.os == 'Linux' && matrix.target == 'aarch64'
-        uses: docker/setup-qemu-action@v3
-      - uses: PyO3/maturin-action@v1
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: PyO3/maturin-action@423a6347767a8b16e65c2a7a7042e4a921528da8 # v1
         with:
           maturin-version: v1.11.5
           command: build
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux || 'off' }}
           args: --release --locked --compatibility pypi --out dist --bindings bin
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: wheel-${{ matrix.target }}-${{ matrix.runner }}
           path: dist/*.whl
@@ -53,11 +63,11 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           pattern: wheel-*
           path: dist
           merge-multiple: true
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         with:
           packages-dir: dist

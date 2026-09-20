@@ -41,7 +41,7 @@ fn main() -> ExitCode {
 }
 
 fn run(command: Vec<String>, json: bool, diagnostic_timeout: u64) -> ExitCode {
-    let result = match aws_why::runner::run_user_command(&command, !json) {
+    let mut result = match aws_why::runner::run_user_command(&command, !json) {
         Ok(result) => result,
         Err(error) => {
             let _ = writeln!(
@@ -55,13 +55,17 @@ fn run(command: Vec<String>, json: bool, diagnostic_timeout: u64) -> ExitCode {
 
     if result.exit_code == 0 {
         if json {
-            let _ = io::stdout().write_all(&result.stdout);
-            let _ = io::stderr().write_all(&result.stderr);
+            let _ = result.replay_stdout();
         }
+        let _ = result.replay_stderr();
+        warn_if_truncated(&result);
         return ExitCode::SUCCESS;
     }
 
     let report = aws_why::analyze(&result, Duration::from_secs(diagnostic_timeout));
+    if !json && report.failure_kind != aws_why::model::FailureKind::Authorization {
+        let _ = result.replay_stderr();
+    }
     let write_result = if json {
         aws_why::output::write_json(&report)
     } else {
@@ -71,4 +75,19 @@ fn run(command: Vec<String>, json: bool, diagnostic_timeout: u64) -> ExitCode {
         let _ = writeln!(io::stderr(), "aws-why: could not write diagnostic: {error}");
     }
     ExitCode::from(result.exit_code.clamp(1, 255) as u8)
+}
+
+fn warn_if_truncated(result: &aws_why::runner::CommandRun) {
+    if result.stdout_truncated {
+        let _ = writeln!(
+            io::stderr(),
+            "aws-why: command stdout exceeded the 64 MiB --json replay limit and was truncated"
+        );
+    }
+    if result.stderr_replay_truncated {
+        let _ = writeln!(
+            io::stderr(),
+            "aws-why: command stderr exceeded the 8 MiB replay limit and was truncated"
+        );
+    }
 }

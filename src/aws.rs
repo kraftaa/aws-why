@@ -18,6 +18,8 @@ pub struct AwsCommandContext {
     profile: Option<String>,
     region: Option<String>,
     service: Option<String>,
+    no_sign_request: bool,
+    explicit_endpoint: bool,
 }
 
 impl AwsCommandContext {
@@ -44,6 +46,13 @@ impl AwsCommandContext {
                 context.profile = Some(value.to_owned());
             } else if let Some(value) = arg.strip_prefix("--region=") {
                 context.region = Some(value.to_owned());
+            } else if arg == "--no-sign-request" {
+                context.no_sign_request = true;
+            } else if arg == "--endpoint-url" || arg.starts_with("--endpoint-url=") {
+                context.explicit_endpoint = true;
+                if arg == "--endpoint-url" {
+                    index += 1;
+                }
             } else if arg == "--profile" || arg == "--region" {
                 if let Some(value) = argv.get(index + 1) {
                     if arg == "--profile" {
@@ -67,7 +76,20 @@ impl AwsCommandContext {
         self.executable.is_some()
     }
 
+    pub fn diagnostic_block_reason(&self) -> Option<&'static str> {
+        if self.no_sign_request {
+            Some("Follow-up diagnostics were skipped because the command used --no-sign-request.")
+        } else if self.explicit_endpoint {
+            Some("Follow-up diagnostics were skipped because the command used a custom endpoint.")
+        } else {
+            None
+        }
+    }
+
     pub fn credential_hint(&self) -> Option<String> {
+        if self.no_sign_request {
+            return Some("unsigned request (--no-sign-request)".to_owned());
+        }
         self.profile
             .as_ref()
             .map(|profile| format!("AWS CLI --profile {profile}"))
@@ -346,6 +368,9 @@ pub fn discover_identity(
     let args = context.args_for(&["sts", "get-caller-identity", "--output", "json"]);
     let output = run_diagnostic(executable, &args, timeout)
         .map_err(|error| format!("Could not determine the caller identity: {error}"))?;
+    if output.truncated {
+        return Err("AWS caller identity output exceeded the diagnostic limit.".to_owned());
+    }
     if !output.success {
         return Err(
             "Could not determine the caller identity with the command's AWS credentials."
@@ -370,11 +395,12 @@ pub fn diagnose_authorization(
     error: &mut AwsErrorEvidence,
     identity: Option<&AwsIdentity>,
     timeout: Duration,
+    allow_followups: bool,
 ) -> Diagnosis {
     fill_action_from_operation(context, error);
     let mut diagnosis = Diagnosis::default();
 
-    if let Some(authorization_id) = error.authorization_id.as_deref() {
+    if allow_followups && let Some(authorization_id) = error.authorization_id.as_deref() {
         match request_authorization_details(context, authorization_id, timeout) {
             Ok(results) if !results.is_empty() => {
                 diagnosis.authorization = results;
@@ -387,7 +413,7 @@ pub fn diagnose_authorization(
         }
     }
 
-    if let Some(encoded) = error.encoded_authorization_message.as_deref() {
+    if allow_followups && let Some(encoded) = error.encoded_authorization_message.as_deref() {
         match decode_authorization_message(context, encoded, timeout) {
             Ok(result) => {
                 diagnosis.authorization.push(result);
@@ -411,8 +437,9 @@ pub fn diagnose_authorization(
         return diagnosis;
     }
 
-    if let (Some(identity), Some(action), Some(resource)) =
-        (identity, error.action.as_deref(), error.resource.as_deref())
+    if allow_followups
+        && let (Some(identity), Some(action), Some(resource)) =
+            (identity, error.action.as_deref(), error.resource.as_deref())
     {
         match simulate(context, identity, action, resource, timeout) {
             Ok(result) => {
@@ -465,6 +492,9 @@ fn request_authorization_details(
     ]);
     let output = run_diagnostic(executable, &args, timeout)
         .map_err(|error| format!("Could not retrieve AWS authorization details: {error}"))?;
+    if output.truncated {
+        return Err("AWS authorization details exceeded the diagnostic limit.".to_owned());
+    }
     if !output.success {
         return Err(
             "AWS request authorization details were unavailable or not permitted.".to_owned(),
@@ -567,6 +597,9 @@ fn decode_authorization_message(
     ]);
     let output = run_diagnostic(executable, &args, timeout)
         .map_err(|error| format!("Could not decode the AWS authorization message: {error}"))?;
+    if output.truncated {
+        return Err("Decoded AWS authorization details exceeded the diagnostic limit.".to_owned());
+    }
     if !output.success {
         return Err("The encoded AWS authorization message could not be decoded; sts:DecodeAuthorizationMessage might be missing.".to_owned());
     }
@@ -634,6 +667,9 @@ fn simulate(
     ]);
     let output = run_diagnostic(executable, &args, timeout)
         .map_err(|error| format!("Could not run IAM policy simulation: {error}"))?;
+    if output.truncated {
+        return Err("IAM policy simulation output exceeded the diagnostic limit.".to_owned());
+    }
     if !output.success {
         return Err("IAM policy simulation was unavailable or not permitted.".to_owned());
     }
@@ -851,6 +887,25 @@ mod tests {
         assert_eq!(context.profile.as_deref(), Some("prod"));
         assert_eq!(context.region.as_deref(), Some("us-west-2"));
         assert_eq!(context.service.as_deref(), Some("s3"));
+    }
+
+    #[test]
+    fn blocks_diagnostics_for_unsigned_and_custom_endpoint_commands() {
+        let unsigned = AwsCommandContext::from_argv(&[
+            "aws".to_owned(),
+            "s3".to_owned(),
+            "ls".to_owned(),
+            "--no-sign-request".to_owned(),
+        ]);
+        assert!(unsigned.diagnostic_block_reason().is_some());
+
+        let custom = AwsCommandContext::from_argv(&[
+            "aws".to_owned(),
+            "--endpoint-url=http://localhost:4566".to_owned(),
+            "s3".to_owned(),
+            "ls".to_owned(),
+        ]);
+        assert!(custom.diagnostic_block_reason().is_some());
     }
 
     #[test]
