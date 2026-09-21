@@ -21,8 +21,20 @@ case "$args" in
     exit 0
     ;;
   *"iam simulate-principal-policy"*)
-    printf '%s\n' '{"Code":"AccessDenied","Message":"simulation not permitted"}' >&2
-    exit 254
+    case "${FAKE_SIMULATION:-denied}" in
+      allowed)
+        printf '%s\n' '{"EvaluationResults":[{"EvalActionName":"s3:GetObject","EvalResourceName":"arn:aws:s3:::example/key","EvalDecision":"allowed","MatchedStatements":[{"SourcePolicyId":"ReadPolicy","SourcePolicyType":"IAM Policy"}],"MissingContextValues":[],"PermissionsBoundaryDecisionDetail":{"AllowedByPermissionsBoundary":true},"OrganizationsDecisionDetail":{"AllowedByOrganizations":true}}]}'
+        exit 0
+        ;;
+      matrix)
+        printf '%s\n' '{"EvaluationResults":[{"EvalActionName":"s3:GetObject","EvalResourceName":"arn:aws:s3:::example/key","EvalDecision":"allowed","MatchedStatements":[{"SourcePolicyId":"ReadPolicy","SourcePolicyType":"IAM Policy"}],"MissingContextValues":[]},{"EvalActionName":"s3:PutObject","EvalResourceName":"arn:aws:s3:::example/key","EvalDecision":"implicitDeny","MatchedStatements":[],"MissingContextValues":["aws:RequestedRegion"]}]}'
+        exit 0
+        ;;
+      *)
+        printf '%s\n' '{"Code":"AccessDenied","Message":"not authorized to perform: iam:SimulatePrincipalPolicy because no identity-based policy allows the iam:SimulatePrincipalPolicy action"}' >&2
+        exit 254
+        ;;
+    esac
     ;;
 esac
 
@@ -228,4 +240,71 @@ fn raw_encoded_authorization_payload_is_not_replayed() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("ACCESS DENIED"));
     assert!(!stderr.contains("SUPERSECRETENCODEDPAYLOAD"));
+}
+
+#[test]
+fn can_reports_an_allowed_simulation_and_returns_success() {
+    let directory = fake_aws();
+    let aws = directory.path().join("aws");
+    let output = Command::new(env!("CARGO_BIN_EXE_aws-why"))
+        .args([
+            "can",
+            "s3:GetObject",
+            "--resource",
+            "arn:aws:s3:::example/key",
+            "--aws-cli",
+            aws.to_str().unwrap(),
+        ])
+        .env("FAKE_SIMULATION", "allowed")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("SIMULATED PERMISSIONS"));
+    assert!(stdout.contains("ALLOWED"));
+    assert!(stdout.contains("s3:GetObject"));
+    assert!(stdout.contains("Simulation only"));
+}
+
+#[test]
+fn permissions_reports_a_matrix_without_fetching_when_actions_are_given() {
+    let directory = fake_aws();
+    let aws = directory.path().join("aws");
+    let output = Command::new(env!("CARGO_BIN_EXE_aws-why"))
+        .args([
+            "permissions",
+            "--service",
+            "s3",
+            "--action",
+            "GetObject",
+            "--action",
+            "PutObject",
+            "--resource",
+            "arn:aws:s3:::example/key",
+            "--aws-cli",
+            aws.to_str().unwrap(),
+        ])
+        .env("FAKE_SIMULATION", "matrix")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("s3:GetObject"));
+    assert!(stdout.contains("s3:PutObject"));
+    assert!(stdout.contains("1 allowed, 1 denied, 0 unknown"));
+    assert!(stdout.contains("missing context: aws:RequestedRegion"));
+}
+
+#[test]
+fn simulation_permission_failure_is_actionable() {
+    let directory = fake_aws();
+    let aws = directory.path().join("aws");
+    let output = Command::new(env!("CARGO_BIN_EXE_aws-why"))
+        .args(["can", "s3:GetObject", "--aws-cli", aws.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("needs iam:SimulatePrincipalPolicy"));
 }

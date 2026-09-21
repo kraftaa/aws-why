@@ -1,12 +1,92 @@
 use std::io::{self, Write};
 
-use crate::model::{AnalysisReport, Confidence, Decision, DenyCause, EvidenceSource, FailureKind};
+use crate::model::{
+    AnalysisReport, Confidence, Decision, DenyCause, EvidenceSource, FailureKind, PermissionReport,
+};
 
 pub fn write_json(report: &AnalysisReport) -> io::Result<()> {
     let stdout = io::stdout();
     let mut lock = stdout.lock();
     serde_json::to_writer_pretty(&mut lock, report)?;
     writeln!(lock)
+}
+
+pub fn write_permission_json(report: &PermissionReport) -> io::Result<()> {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    serde_json::to_writer_pretty(&mut out, report)?;
+    writeln!(out)
+}
+
+pub fn write_permission_human(report: &PermissionReport) -> io::Result<()> {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    writeln!(out, "SIMULATED PERMISSIONS\n")?;
+    writeln!(out, "Identity")?;
+    writeln!(out, "  account: {}", report.identity.account_id)?;
+    writeln!(out, "  principal: {}", report.identity.display_name())?;
+    if let Some(session) = &report.identity.session_name {
+        writeln!(out, "  session: {session}")?;
+    }
+    writeln!(out, "  policy source: {}\n", report.policy_source_arn)?;
+
+    let mut allowed = 0;
+    let mut denied = 0;
+    let mut unknown = 0;
+    let mut current_resource: Option<&str> = None;
+    for evaluation in &report.authorization {
+        let resource = evaluation.resource.as_deref().unwrap_or("*");
+        if current_resource != Some(resource) {
+            writeln!(out, "Resource")?;
+            writeln!(out, "  {resource}")?;
+            current_resource = Some(resource);
+        }
+        let (label, marker) = match evaluation.decision {
+            Decision::Allowed => {
+                allowed += 1;
+                ("ALLOWED", "+")
+            }
+            Decision::ExplicitDeny | Decision::ImplicitDeny => {
+                denied += 1;
+                ("DENIED", "-")
+            }
+            Decision::Unknown => {
+                unknown += 1;
+                ("UNKNOWN", "?")
+            }
+        };
+        write!(
+            out,
+            "  {marker} {:<8} {}",
+            label,
+            evaluation.action.as_deref().unwrap_or("unknown:Unknown")
+        )?;
+        if let Some(cause) = &evaluation.cause {
+            write!(out, " — {}", cause.label())?;
+        }
+        writeln!(out)?;
+        if let Some(policy) = &evaluation.policy {
+            writeln!(out, "              policy: {policy}")?;
+        }
+        if !evaluation.missing_context.is_empty() {
+            writeln!(
+                out,
+                "              missing context: {}",
+                evaluation.missing_context.join(", ")
+            )?;
+        }
+    }
+    writeln!(
+        out,
+        "\nSummary: {allowed} allowed, {denied} denied, {unknown} unknown"
+    )?;
+    for note in &report.notes {
+        writeln!(out, "Note: {note}")?;
+    }
+    writeln!(
+        out,
+        "Simulation only: this does not execute the actions or prove a live request will succeed."
+    )
 }
 
 pub fn write_human(report: &AnalysisReport) -> io::Result<()> {

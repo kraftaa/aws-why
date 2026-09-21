@@ -176,6 +176,58 @@ pub struct AuthorizationResult {
     pub missing_context: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct PermissionReport {
+    pub result: &'static str,
+    pub identity: AwsIdentity,
+    pub policy_source_arn: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+    pub authorization: Vec<AuthorizationResult>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+}
+
+impl PermissionReport {
+    pub fn new(
+        mut identity: AwsIdentity,
+        policy_source_arn: String,
+        service: Option<String>,
+        mut authorization: Vec<AuthorizationResult>,
+        notes: Vec<String>,
+    ) -> Self {
+        identity.account_id = sanitize_generated_text(&identity.account_id);
+        identity.arn = sanitize_generated_text(&identity.arn);
+        identity.role_name = identity.role_name.as_deref().map(sanitize_generated_text);
+        identity.user_name = identity.user_name.as_deref().map(sanitize_generated_text);
+        identity.session_name = identity
+            .session_name
+            .as_deref()
+            .map(sanitize_generated_text);
+        for result in &mut authorization {
+            result.action = result.action.as_deref().map(sanitize_generated_text);
+            result.resource = result.resource.as_deref().map(sanitize_generated_text);
+            result.policy = result.policy.as_deref().map(sanitize_generated_text);
+            result.missing_context = result
+                .missing_context
+                .iter()
+                .map(|value| sanitize_generated_text(value))
+                .collect();
+        }
+        Self {
+            result: "simulated",
+            identity,
+            policy_source_arn: sanitize_generated_text(&policy_source_arn),
+            service: service.as_deref().map(sanitize_generated_text),
+            authorization,
+            notes: notes
+                .iter()
+                .map(|note| sanitize_generated_text(note))
+                .collect(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AwsErrorEvidence {
     pub service: Option<String>,
@@ -280,7 +332,7 @@ impl AnalysisReport {
     }
 }
 
-fn sanitize_generated_text(input: &str) -> String {
+pub(crate) fn sanitize_generated_text(input: &str) -> String {
     let mut output = input.to_owned();
     for marker in [
         "Encoded authorization failure message:",

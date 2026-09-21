@@ -1,6 +1,7 @@
 pub mod aws;
 pub mod model;
 pub mod output;
+pub mod permissions;
 pub mod runner;
 
 use std::time::Duration;

@@ -23,6 +23,19 @@ pub struct AwsCommandContext {
 }
 
 impl AwsCommandContext {
+    pub fn for_diagnostics(
+        executable: String,
+        profile: Option<String>,
+        region: Option<String>,
+    ) -> Self {
+        Self {
+            executable: Some(executable),
+            profile,
+            region,
+            ..Self::default()
+        }
+    }
+
     pub fn from_argv(argv: &[String]) -> Self {
         let Some(executable) = argv.first() else {
             return Self::default();
@@ -679,8 +692,106 @@ fn simulate(
         .ok_or_else(|| "IAM policy simulation returned no evaluation result.".to_owned())
 }
 
+pub fn simulate_permissions(
+    context: &AwsCommandContext,
+    identity: &AwsIdentity,
+    actions: &[String],
+    resources: &[String],
+    timeout: Duration,
+) -> Result<Vec<AuthorizationResult>, String> {
+    let source = identity.policy_source_arn().ok_or_else(|| {
+        "IAM simulation supports IAM users and roles, not this principal type.".to_owned()
+    })?;
+    let executable = context.executable()?;
+    let mut results = Vec::new();
+
+    for resource in resources {
+        for action_batch in actions.chunks(50) {
+            let mut args = context.args_for(&[
+                "iam",
+                "simulate-principal-policy",
+                "--policy-source-arn",
+                &source,
+                "--action-names",
+            ]);
+            args.extend(action_batch.iter().map(OsString::from));
+            args.push("--resource-arns".into());
+            args.push(resource.into());
+            args.push("--max-items".into());
+            args.push("1000".into());
+            args.push("--output".into());
+            args.push("json".into());
+
+            let output = run_diagnostic(executable, &args, timeout)
+                .map_err(|error| format!("Could not run IAM policy simulation: {error}"))?;
+            if output.truncated {
+                return Err(
+                    "IAM policy simulation output exceeded the diagnostic limit.".to_owned(),
+                );
+            }
+            if !output.success {
+                let detail = parse_aws_error(&output.stderr);
+                return Err(
+                    if detail
+                        .as_ref()
+                        .is_some_and(|item| item.failure_kind == FailureKind::Authorization)
+                    {
+                        format!(
+                            "IAM denied the simulation request. The caller needs iam:SimulatePrincipalPolicy for {source}."
+                        )
+                    } else if let Some(detail) = detail {
+                        format!("IAM policy simulation failed with {}.", detail.error_code)
+                    } else {
+                        "IAM policy simulation failed without a readable AWS error.".to_owned()
+                    },
+                );
+            }
+            let value: Value = serde_json::from_slice(&output.stdout)
+                .map_err(|_| "AWS returned an unreadable policy simulation.".to_owned())?;
+            let parsed = parse_simulations(&value);
+            if parsed.len() != action_batch.len() {
+                return Err(format!(
+                    "IAM policy simulation returned {} of {} expected evaluation results.",
+                    parsed.len(),
+                    action_batch.len()
+                ));
+            }
+            results.extend(parsed);
+        }
+    }
+    Ok(results)
+}
+
+fn parse_simulations(value: &Value) -> Vec<AuthorizationResult> {
+    value
+        .get("EvaluationResults")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|evaluation| {
+            let action = evaluation
+                .get("EvalActionName")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown:Unknown");
+            let resource = evaluation
+                .get("EvalResourceName")
+                .and_then(Value::as_str)
+                .unwrap_or("*");
+            parse_simulation_evaluation(evaluation, action, resource)
+        })
+        .collect()
+}
+
 fn parse_simulation(value: &Value, action: &str, resource: &str) -> Option<AuthorizationResult> {
     let evaluation = value.get("EvaluationResults")?.as_array()?.first()?;
+    parse_simulation_evaluation(evaluation, action, resource)
+}
+
+fn parse_simulation_evaluation(
+    evaluation: &Value,
+    action: &str,
+    resource: &str,
+) -> Option<AuthorizationResult> {
     let decision = parse_decision(evaluation.get("EvalDecision")?.as_str()?);
     let boundary_allows = evaluation
         .pointer("/PermissionsBoundaryDecisionDetail/AllowedByPermissionsBoundary")
@@ -707,7 +818,9 @@ fn parse_simulation(value: &Value, action: &str, resource: &str) -> Option<Autho
         .filter_map(Value::as_str)
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    let cause = if boundary_allows == Some(false) {
+    let cause = if decision == Decision::Allowed {
+        None
+    } else if boundary_allows == Some(false) {
         Some(DenyCause::PermissionsBoundary)
     } else if organization_allows == Some(false) {
         Some(DenyCause::ServiceControlPolicy)
@@ -717,8 +830,6 @@ fn parse_simulation(value: &Value, action: &str, resource: &str) -> Option<Autho
         Some(cause_from_policy_type(kind, decision.clone()))
     } else if decision == Decision::ImplicitDeny {
         Some(DenyCause::MissingIdentityAllow)
-    } else if decision == Decision::Allowed {
-        None
     } else {
         Some(DenyCause::Unknown)
     };
@@ -945,6 +1056,7 @@ mod tests {
         .unwrap();
         let result = parse_simulation(&value, "s3:GetObject", "arn:aws:s3:::b/k").unwrap();
         assert_eq!(result.decision, Decision::Allowed);
+        assert_eq!(result.cause, None);
         assert_eq!(result.confidence, Confidence::Simulated);
         assert_eq!(result.evidence_source, EvidenceSource::PolicySimulation);
     }

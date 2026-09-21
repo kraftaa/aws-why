@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "aws-why"
 dynamic = ["version"]
-description = "Run AWS CLI commands and explain authorization failures with evidence"
+description = "Explain AWS authorization failures and safely simulate IAM permissions"
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
