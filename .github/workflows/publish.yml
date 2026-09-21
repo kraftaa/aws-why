@@ -27,7 +27,7 @@ jobs:
           - runner: ubuntu-24.04
             target: x86_64
             manylinux: "2_17"
-          - runner: ubuntu-24.04
+          - runner: ubuntu-24.04-arm
             target: aarch64
             manylinux: "2_17"
           - runner: macos-15-intel
@@ -39,9 +39,6 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-      - name: Enable ARM64 container emulation
-        if: runner.os == 'Linux' && matrix.target == 'aarch64'
-        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
       - uses: PyO3/maturin-action@423a6347767a8b16e65c2a7a7042e4a921528da8 # v1
         with:
           maturin-version: v1.11.5

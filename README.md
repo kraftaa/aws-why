@@ -154,4 +154,4 @@ maturin build --release --bindings bin
 
 The end-to-end tests use a temporary fake AWS executable and never contact AWS.
 
-Tagged releases build platform-specific wheels and publish them through PyPI Trusted Publishing. Configure this repository as a trusted publisher for the `aws-why` PyPI project with environment name `pypi`, require maintainer approval on that GitHub environment, protect release tags, and push a tag matching the Cargo version, such as `v0.2.0`. The workflow rejects tags that do not match the Cargo package version, and every third-party action is pinned to an immutable commit.
+Tagged releases build platform-specific wheels and publish them through PyPI Trusted Publishing. Configure this repository as a trusted publisher for the `aws-why` PyPI project with environment name `pypi`, require maintainer approval on that GitHub environment, protect release tags, and push a tag matching the Cargo version. The workflow rejects tags that do not match the Cargo package version, and every third-party action is pinned to an immutable commit.
