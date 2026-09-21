@@ -265,10 +265,38 @@ pub struct AnalysisReport {
     pub error: Option<ErrorSummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub authorization: Vec<AuthorizationResult>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remediation: Vec<Remediation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credential_source: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Remediation {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource: Option<String>,
+    pub guidance: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_policy: Option<CandidatePolicy>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct CandidatePolicy {
+    pub version: &'static str,
+    pub statement: Vec<CandidateStatement>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct CandidateStatement {
+    pub effect: &'static str,
+    pub action: String,
+    pub resource: String,
 }
 
 impl AnalysisReport {
@@ -319,6 +347,7 @@ impl AnalysisReport {
             .map(|value| sanitize_generated_text(value))
             .collect();
         credential_source = credential_source.as_deref().map(sanitize_generated_text);
+        let remediation = authorization.iter().filter_map(remediation_for).collect();
         Self {
             result,
             exit_code,
@@ -326,10 +355,73 @@ impl AnalysisReport {
             identity,
             error,
             authorization,
+            remediation,
             credential_source,
             notes,
         }
     }
+}
+
+fn remediation_for(result: &AuthorizationResult) -> Option<Remediation> {
+    let cause = result.cause.as_ref()?;
+    let guidance = match cause {
+        DenyCause::MissingIdentityAllow => {
+            "If this access is expected, ask an administrator to add an identity-policy Allow for the reported action and resource."
+        }
+        DenyCause::IdentityPolicyExplicitDeny => {
+            "An additional Allow will not override this denial. Ask the identity-policy owner to review the explicit Deny."
+        }
+        DenyCause::PermissionsBoundary => {
+            "An identity-policy Allow alone will not fix this. Ask the boundary owner to permit the action, then verify the identity policy also allows it."
+        }
+        DenyCause::ServiceControlPolicy => {
+            "An identity-policy Allow will not override this. Ask the AWS Organizations administrator to review the service control policy."
+        }
+        DenyCause::ResourceControlPolicy => {
+            "An identity-policy Allow will not override this. Ask the AWS Organizations administrator to review the resource control policy."
+        }
+        DenyCause::ResourcePolicy => {
+            "Ask the resource owner to review its resource-based policy; an identity-policy change alone may not fix this."
+        }
+        DenyCause::SessionPolicy => {
+            "Ask whoever creates the role session to review its session policy; changing the role policy alone may not fix this session."
+        }
+        DenyCause::VpcEndpointPolicy => {
+            "Ask the VPC endpoint owner to review the endpoint policy; an identity-policy Allow will not override it."
+        }
+        DenyCause::RoleTrustPolicy => {
+            "Ask the role owner to review the role trust policy and the caller allowed to assume it."
+        }
+        DenyCause::KmsKeyPolicy => {
+            "Ask the KMS key administrator to review the key policy; an identity-policy Allow alone may not grant access."
+        }
+        DenyCause::Condition => {
+            "Review the policy conditions and the request context reported by AWS before changing permissions."
+        }
+        DenyCause::Unknown => return None,
+    };
+    let candidate_policy = if *cause == DenyCause::MissingIdentityAllow {
+        result
+            .action
+            .as_ref()
+            .zip(result.resource.as_ref())
+            .map(|(action, resource)| CandidatePolicy {
+                version: "2012-10-17",
+                statement: vec![CandidateStatement {
+                    effect: "Allow",
+                    action: action.clone(),
+                    resource: resource.clone(),
+                }],
+            })
+    } else {
+        None
+    };
+    Some(Remediation {
+        action: result.action.clone(),
+        resource: result.resource.clone(),
+        guidance: guidance.to_owned(),
+        candidate_policy,
+    })
 }
 
 pub(crate) fn sanitize_generated_text(input: &str) -> String {

@@ -149,7 +149,16 @@ fn write_simple(
 }
 
 fn write_authorization(out: &mut impl Write, report: &AnalysisReport) -> io::Result<()> {
-    writeln!(out, "\nACCESS DENIED\n")?;
+    write!(out, "\nACCESS DENIED")?;
+    if report.authorization.len() == 1
+        && let Some(action) = &report.authorization[0].action
+    {
+        write!(out, ": {action}")?;
+        if let Some(resource) = &report.authorization[0].resource {
+            write!(out, " on {resource}")?;
+        }
+    }
+    writeln!(out, "\n")?;
     if let Some(identity) = &report.identity {
         writeln!(out, "Identity")?;
         writeln!(out, "  account: {}", identity.account_id)?;
@@ -163,13 +172,14 @@ fn write_authorization(out: &mut impl Write, report: &AnalysisReport) -> io::Res
         if report.authorization.len() > 1 {
             writeln!(out, "Authorization check {}", index + 1)?;
         }
-        if let Some(action) = &result.action {
-            writeln!(out, "Failed operation")?;
-            writeln!(out, "  {action}\n")?;
-        }
-        if let Some(resource) = &result.resource {
-            writeln!(out, "Resource")?;
-            writeln!(out, "  {resource}\n")?;
+        if report.authorization.len() > 1 {
+            if let Some(action) = &result.action {
+                writeln!(out, "  action: {action}")?;
+            }
+            if let Some(resource) = &result.resource {
+                writeln!(out, "  resource: {resource}")?;
+            }
+            writeln!(out)?;
         }
         if let Some(cause) = &result.cause {
             writeln!(out, "Cause")?;
@@ -193,6 +203,18 @@ fn write_authorization(out: &mut impl Write, report: &AnalysisReport) -> io::Res
             source_label(&result.evidence_source),
             confidence_label(&result.confidence)
         )?;
+        if result.evidence_source == EvidenceSource::AwsError
+            && result.confidence == Confidence::Reported
+            && result
+                .cause
+                .as_ref()
+                .is_some_and(|cause| *cause != DenyCause::Unknown)
+        {
+            writeln!(
+                out,
+                "AWS already identified this cause; IAM simulation was not required.\n"
+            )?;
+        }
         if result.decision == Decision::Allowed {
             writeln!(out, "SIMULATION ALLOWS THIS REQUEST")?;
             writeln!(
@@ -214,6 +236,40 @@ fn write_authorization(out: &mut impl Write, report: &AnalysisReport) -> io::Res
         writeln!(out, "Credential source")?;
         writeln!(out, "  {source}\n")?;
     }
+    for recommendation in &report.remediation {
+        writeln!(out, "What to do next")?;
+        writeln!(out, "  {}\n", recommendation.guidance)?;
+        if let Some(action) = &recommendation.action {
+            writeln!(out, "Administrator handoff")?;
+            if let Some(identity) = &report.identity {
+                writeln!(
+                    out,
+                    "  principal: {}",
+                    identity
+                        .policy_source_arn()
+                        .unwrap_or_else(|| identity.arn.clone())
+                )?;
+            }
+            writeln!(out, "  action: {action}")?;
+            if let Some(resource) = &recommendation.resource {
+                writeln!(out, "  resource: {resource}")?;
+            } else {
+                writeln!(out, "  resource: not reported by AWS")?;
+            }
+            writeln!(out)?;
+        }
+        if let Some(policy) = &recommendation.candidate_policy {
+            writeln!(out, "Candidate policy (administrator review required)")?;
+            let rendered = serde_json::to_string_pretty(policy)?;
+            for line in rendered.lines() {
+                writeln!(out, "  {line}")?;
+            }
+            writeln!(
+                out,
+                "  This addresses the reported denial only; another policy layer may still block the request.\n"
+            )?;
+        }
+    }
     if !report.notes.is_empty() {
         writeln!(out, "Notes")?;
         for note in &report.notes {
@@ -221,10 +277,14 @@ fn write_authorization(out: &mut impl Write, report: &AnalysisReport) -> io::Res
         }
         writeln!(out)?;
     }
-    if report
-        .authorization
-        .iter()
-        .all(|item| item.confidence != Confidence::Verified)
+    if report.authorization.is_empty()
+        || report.authorization.iter().any(|item| {
+            item.confidence == Confidence::Incomplete
+                || item
+                    .cause
+                    .as_ref()
+                    .is_none_or(|cause| *cause == DenyCause::Unknown)
+        })
     {
         writeln!(
             out,

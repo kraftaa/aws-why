@@ -58,7 +58,7 @@ pub fn analyze(run: &CommandRun, diagnostic_timeout: Duration) -> AnalysisReport
                 identity.as_ref(),
                 item.resource.as_deref(),
             );
-            return AnalysisReport::from_parts(
+            let mut report = AnalysisReport::from_parts(
                 run.exit_code,
                 failure_kind,
                 identity,
@@ -67,6 +67,10 @@ pub fn analyze(run: &CommandRun, diagnostic_timeout: Duration) -> AnalysisReport
                 diagnostic_notes,
                 context.credential_hint(),
             );
+            if !allow_followups {
+                report.remediation.clear();
+            }
+            return report;
         }
     }
 

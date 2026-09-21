@@ -64,6 +64,10 @@ case "${FAKE_SCENARIO:-success}" in
     printf '%s\n' 'An error occurred (AccessDenied) when calling the GetObject operation: User: arn:aws:sts::111111111111:assumed-role/AnalyticsDeveloper/example-session is not authorized to perform: s3:GetObject on resource: arn:aws:s3:::company-prod/orders.parquet because no identity-based policy allows the s3:GetObject action' >&2
     exit 254
     ;;
+  kms_list)
+    printf '%s\n' 'An error occurred (AccessDeniedException) when calling the ListKeys operation: User: arn:aws:sts::111111111111:assumed-role/DataEngineer/example-session is not authorized to perform: kms:ListKeys on resource: * because no identity-based policy allows the kms:ListKeys action' >&2
+    exit 254
+    ;;
   scp)
     printf '%s\n' 'An error occurred (AccessDenied) when calling the PutObject operation: User: arn:aws:sts::111111111111:assumed-role/DataEngineer/example-session is not authorized to perform: s3:PutObject on resource: arn:aws:s3:::prod-data/x.csv with an explicit deny in a service control policy: arn:aws:organizations::999999999999:policy/o-example/service_control_policy/p-guardrail' >&2
     exit 254
@@ -185,12 +189,27 @@ fn names_missing_s3_permission() {
 }
 
 #[test]
+fn turns_conclusive_denial_into_an_admin_handoff() {
+    let output = invoke("kms_list", false);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("ACCESS DENIED: kms:ListKeys on *"));
+    assert!(stderr.contains("AWS already identified this cause"));
+    assert!(stderr.contains("Administrator handoff"));
+    assert!(stderr.contains("arn:aws:iam::111111111111:role/DataEngineer"));
+    assert!(stderr.contains("Candidate policy (administrator review required)"));
+    assert!(stderr.contains("\"Action\": \"kms:ListKeys\""));
+    assert!(stderr.contains("\"Resource\": \"*\""));
+    assert!(!stderr.contains("could not obtain complete AWS authorization details"));
+}
+
+#[test]
 fn identifies_scp_and_does_not_recommend_another_allow() {
     let output = invoke("scp", false);
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("a service control policy blocks the action"));
     assert!(stderr.contains("p-guardrail"));
     assert!(!stderr.contains("add an Allow"));
+    assert!(!stderr.contains("Candidate policy"));
 }
 
 #[test]
@@ -212,6 +231,11 @@ fn json_mode_emits_one_machine_readable_failure() {
     assert_eq!(value["authorization"][0]["action"], "s3:PutObject");
     assert_eq!(value["authorization"][0]["cause"], "permissions_boundary");
     assert_eq!(value["authorization"][0]["confidence"], "reported");
+    assert_eq!(
+        value["remediation"][0]["guidance"],
+        "An identity-policy Allow alone will not fix this. Ask the boundary owner to permit the action, then verify the identity policy also allows it."
+    );
+    assert!(value["remediation"][0]["candidate_policy"].is_null());
 }
 
 #[test]
@@ -220,6 +244,7 @@ fn unsigned_command_never_triggers_credentialed_diagnostics() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("skipped because the command used --no-sign-request"));
     assert!(!stderr.contains("Identity\n"));
+    assert!(!stderr.contains("Candidate policy"));
 }
 
 #[test]
@@ -232,6 +257,7 @@ fn custom_endpoint_command_never_triggers_follow_up_calls() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("skipped because the command used a custom endpoint"));
     assert!(!stderr.contains("Identity\n"));
+    assert!(!stderr.contains("Candidate policy"));
 }
 
 #[test]

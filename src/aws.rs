@@ -192,7 +192,7 @@ pub fn parse_aws_error(raw: &[u8]) -> Option<AwsErrorEvidence> {
     );
     let resource = capture(
         &message,
-        r"(?i)(?:on resource(?:s)?|resource)\s*:\s*(arn:[^\s,;]+)",
+        r"(?i)(?:on resource(?:s)?|resource)\s*:\s*((?:arn:[^\s,;]+)|\*)",
     )
     .map(trim_sentence_punctuation);
     let principal_arn = capture(
