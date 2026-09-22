@@ -29,10 +29,9 @@ The normal installation does not require Rust or Cargo. Install the native execu
 
 ```console
 pipx install aws-why
+aws-why doctor
 aws-why run -- aws sts get-caller-identity
 aws-why run --json -- aws s3api get-object --bucket example --key report.csv report.csv
-aws-why can s3:GetObject --resource arn:aws:s3:::example/report.csv
-aws-why permissions --service s3 --resource arn:aws:s3:::example/report.csv
 ```
 
 Or use `uv`:
@@ -43,7 +42,44 @@ uv tool install aws-why
 
 Release wheels contain the compiled executable; Python is only the distribution mechanism. Wheels are built for macOS on Apple Silicon and Intel, Linux on ARM64 and x86-64, and Windows x86-64.
 
-## Check permissions safely
+## Check your setup
+
+Run `doctor` before you need to diagnose a failure:
+
+```console
+$ aws-why doctor
+
+AWS-WHY DOCTOR
+
++ AWS credentials
+  arn:aws:iam::123456789012:role/DataEngineer
+
++ Denial explanations
+  Available. AWS-reported causes do not require IAM simulation.
+
+- Permission simulation (optional)
+  Unavailable. `run` still works; `can` and `permissions` require iam:SimulatePrincipalPolicy.
+
+READY
+  Run: aws-why run -- aws <service> <operation>
+```
+
+`doctor` calls `sts:GetCallerIdentity` and makes a harmless `iam:SimulatePrincipalPolicy` request to determine which features are available. Missing simulation access is informational and does not make `doctor` fail because the normal `run` workflow does not require it. Use `--profile`, `--region`, `--aws-cli`, `--json`, or `--redact` when needed.
+
+## Share diagnostics safely
+
+Generated reports contain real AWS identity and resource identifiers by default because administrators need them to fix access. Use `--redact` before posting output publicly:
+
+```console
+aws-why run --redact -- aws s3api get-object \
+  --bucket example \
+  --key report.csv \
+  report.csv
+```
+
+Redaction masks account, principal, session, resource, policy, and request identifiers in both human and JSON failure reports. It also suppresses output produced by a wrapped command that ultimately fails, so earlier partial output cannot undermine the redaction. It does not alter output from a successful wrapped command, because successful commands remain transparent pass-throughs.
+
+## Advanced: simulate permissions safely
 
 `can` evaluates one IAM action against one or more resources without executing that action:
 

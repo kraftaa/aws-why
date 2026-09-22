@@ -17,6 +17,10 @@ case "$args" in
       printf 'diagnostic did not disable custom endpoints\n' >&2
       exit 90
     fi
+    if [ "${FAKE_IDENTITY:-}" = "fail" ]; then
+      printf 'Unable to locate credentials\n' >&2
+      exit 254
+    fi
     printf '%s\n' '{"UserId":"id","Account":"111111111111","Arn":"arn:aws:sts::111111111111:assumed-role/DataEngineer/example-session"}'
     exit 0
     ;;
@@ -47,6 +51,11 @@ case "${FAKE_SCENARIO:-success}" in
     printf 'command output\n'
     printf 'command warning\n' >&2
     exit 0
+    ;;
+  leaky_failure)
+    printf 'partial output for private-customer\n'
+    printf '%s\n' 'An error occurred (AccessDeniedException) when calling the ListKeys operation: User: arn:aws:sts::111111111111:assumed-role/DataEngineer/example-session is not authorized to perform: kms:ListKeys on resource: * because no identity-based policy allows the kms:ListKeys action' >&2
+    exit 254
     ;;
   boundary)
     printf '%s\n' 'An error occurred (AccessDenied) when calling the PutObject operation: User: arn:aws:sts::111111111111:assumed-role/DataEngineer/example-session is not authorized to perform: s3:PutObject on resource: arn:aws:s3:::prod-data/x.csv because no permissions boundary allows the s3:PutObject action' >&2
@@ -141,6 +150,28 @@ fn invoke_verbose(scenario: &str) -> Output {
         .unwrap()
 }
 
+fn invoke_redacted(scenario: &str, json: bool) -> Output {
+    let directory = fake_aws();
+    let aws = directory.path().join("aws");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_aws-why"));
+    command.arg("run").arg("--redact");
+    if json {
+        command.arg("--json");
+    }
+    command
+        .args([
+            "--",
+            aws.to_str().unwrap(),
+            "s3",
+            "cp",
+            "x.csv",
+            "s3://prod-data/x.csv",
+        ])
+        .env("FAKE_SCENARIO", scenario)
+        .output()
+        .unwrap()
+}
+
 #[test]
 fn successful_command_is_transparent_and_quiet() {
     let output = invoke("success", false);
@@ -212,13 +243,180 @@ fn turns_conclusive_denial_into_an_admin_handoff() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("DENIED: kms:ListKeys on *"));
     assert!(stderr.contains("arn:aws:iam::111111111111:role/DataEngineer"));
-    assert!(stderr.contains("ASK YOUR ADMIN FOR"));
+    assert!(stderr.contains("SEND TO YOUR AWS ADMIN"));
+    assert!(stderr.contains("Principal: arn:aws:iam::111111111111:role/DataEngineer"));
+    assert!(stderr.contains("Missing: kms:ListKeys on *"));
     assert!(stderr.contains("\"Action\": \"kms:ListKeys\""));
     assert!(stderr.contains("\"Resource\": \"*\""));
     assert!(!stderr.contains("Evidence"));
     assert!(!stderr.contains("Credential source"));
     assert!(!stderr.contains("session:"));
     assert!(!stderr.contains("could not obtain complete AWS authorization details"));
+    assert!(!stderr.contains("\nRole\n"));
+}
+
+#[test]
+fn redact_masks_identifiers_in_human_output() {
+    let output = invoke_redacted("missing_get", false);
+    assert_eq!(output.status.code(), Some(254));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("arn:aws:iam::<account-id>:role/<role>"));
+    assert!(stderr.contains("s3:GetObject on <resource>"));
+    assert!(!stderr.contains("111111111111"));
+    assert!(!stderr.contains("AnalyticsDeveloper"));
+    assert!(!stderr.contains("example-session"));
+    assert!(!stderr.contains("company-prod"));
+}
+
+#[test]
+fn redact_masks_identifiers_in_json_output() {
+    let output = invoke_redacted("cross_account", true);
+    let text = String::from_utf8(output.stdout).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(value["identity"]["account_id"], "<account-id>");
+    assert_eq!(value["authorization"][0]["resource"], "<resource>");
+    assert!(!text.contains("111111111111"));
+    assert!(!text.contains("222222222222"));
+    assert!(!text.contains("DataEngineer"));
+    assert!(!text.contains("example-session"));
+    assert!(!text.contains("secret:prod"));
+}
+
+#[test]
+fn redact_masks_named_policy_identifiers() {
+    let output = invoke_redacted("scp", false);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("policy: <policy-arn>"));
+    assert!(!stderr.contains("999999999999"));
+    assert!(!stderr.contains("p-guardrail"));
+}
+
+#[test]
+fn redact_does_not_replay_raw_non_authorization_errors() {
+    let output = invoke_redacted("expired", false);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("AUTHENTICATION FAILURE"));
+    assert!(!stderr.contains("security token included in the request"));
+}
+
+#[test]
+fn redact_suppresses_partial_output_from_a_failed_command() {
+    let output = invoke_redacted("leaky_failure", false);
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(!stderr.contains("private-customer"));
+    assert!(stderr.contains("DENIED: kms:ListKeys on *"));
+}
+
+#[test]
+fn redact_keeps_successful_commands_transparent() {
+    let output = invoke_redacted("success_stderr", false);
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"command output\n");
+    assert_eq!(output.stderr, b"command warning\n");
+}
+
+#[test]
+fn redact_masks_a_command_path_when_execution_fails() {
+    let output = Command::new(env!("CARGO_BIN_EXE_aws-why"))
+        .args(["run", "--redact", "--", "/private/secret-user/missing-aws"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(126));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("could not execute wrapped command"));
+    assert!(!stderr.contains("secret-user"));
+}
+
+#[test]
+fn doctor_explains_that_simulation_is_optional() {
+    let directory = fake_aws();
+    let aws = directory.path().join("aws");
+    let output = Command::new(env!("CARGO_BIN_EXE_aws-why"))
+        .args(["doctor", "--aws-cli", aws.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("AWS-WHY DOCTOR"));
+    assert!(stdout.contains("+ Denial explanations"));
+    assert!(stdout.contains("Permission simulation (optional)"));
+    assert!(stdout.contains("`run` still works"));
+    assert!(stdout.contains("READY"));
+}
+
+#[test]
+fn doctor_reports_available_simulation_and_can_redact_identity() {
+    let directory = fake_aws();
+    let aws = directory.path().join("aws");
+    let output = Command::new(env!("CARGO_BIN_EXE_aws-why"))
+        .args(["doctor", "--redact", "--aws-cli", aws.to_str().unwrap()])
+        .env("FAKE_SIMULATION", "allowed")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("+ Permission simulation"));
+    assert!(stdout.contains("arn:aws:iam::<account-id>:role/<role>"));
+    assert!(!stdout.contains("111111111111"));
+    assert!(!stdout.contains("DataEngineer"));
+}
+
+#[test]
+fn doctor_redacts_json_error_details() {
+    let directory = fake_aws();
+    let aws = directory.path().join("aws");
+    let output = Command::new(env!("CARGO_BIN_EXE_aws-why"))
+        .args([
+            "doctor",
+            "--json",
+            "--redact",
+            "--aws-cli",
+            aws.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(value["identity"]["account_id"], "<account-id>");
+    assert_eq!(value["policy_simulation"]["available"], false);
+    assert_eq!(
+        value["policy_simulation"]["detail"],
+        "IAM simulation is unavailable (detail redacted)."
+    );
+    assert!(!text.contains("111111111111"));
+    assert!(!text.contains("DataEngineer"));
+}
+
+#[test]
+fn doctor_fails_when_credentials_are_unavailable() {
+    let directory = fake_aws();
+    let aws = directory.path().join("aws");
+    let output = Command::new(env!("CARGO_BIN_EXE_aws-why"))
+        .args(["doctor", "--aws-cli", aws.to_str().unwrap()])
+        .env("FAKE_IDENTITY", "fail")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("NOT READY"));
+    assert!(stdout.contains("Fix AWS credentials or profile selection"));
+}
+
+#[test]
+fn doctor_redacts_identity_discovery_errors() {
+    let directory = fake_aws();
+    let aws = directory.path().join("aws");
+    let output = Command::new(env!("CARGO_BIN_EXE_aws-why"))
+        .args(["doctor", "--redact", "--aws-cli", aws.to_str().unwrap()])
+        .env("FAKE_IDENTITY", "fail")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("detail redacted"));
+    assert!(!stdout.contains("Unable to locate credentials"));
 }
 
 #[test]

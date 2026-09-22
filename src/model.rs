@@ -91,6 +91,30 @@ impl AwsIdentity {
             _ => None,
         }
     }
+
+    pub fn redacted(&self) -> Self {
+        let mut identity = self.clone();
+        identity.account_id = "<account-id>".to_owned();
+        identity.role_name = identity.role_name.as_ref().map(|_| "<role>".to_owned());
+        identity.user_name = identity.user_name.as_ref().map(|_| "<user>".to_owned());
+        identity.session_name = identity
+            .session_name
+            .as_ref()
+            .map(|_| "<session>".to_owned());
+        identity.arn = match identity.principal_type {
+            PrincipalType::AssumedRole => {
+                "arn:aws:sts::<account-id>:assumed-role/<role>/<session>".to_owned()
+            }
+            PrincipalType::Role => "arn:aws:iam::<account-id>:role/<role>".to_owned(),
+            PrincipalType::User => "arn:aws:iam::<account-id>:user/<user>".to_owned(),
+            PrincipalType::Root => "arn:aws:iam::<account-id>:root".to_owned(),
+            PrincipalType::FederatedUser => {
+                "arn:aws:sts::<account-id>:federated-user/<user>".to_owned()
+            }
+            PrincipalType::Unknown => "<principal-arn>".to_owned(),
+        };
+        identity
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -359,6 +383,49 @@ impl AnalysisReport {
             credential_source,
             notes,
         }
+    }
+
+    /// Return a share-safe copy of a generated diagnostic. This intentionally
+    /// favors removing useful identifiers over trying to infer whether a name
+    /// is sensitive.
+    pub fn redacted(&self) -> Self {
+        let mut report = self.clone();
+        report.identity = report.identity.as_ref().map(AwsIdentity::redacted);
+        if let Some(error) = report.error.as_mut() {
+            error.message =
+                "AWS error message redacted; rerun without --redact to view it.".to_owned();
+            error.request_id = error.request_id.as_ref().map(|_| "<request-id>".to_owned());
+        }
+        for result in &mut report.authorization {
+            result.resource = result.resource.as_ref().map(|resource| {
+                if resource == "*" {
+                    "*".to_owned()
+                } else {
+                    "<resource>".to_owned()
+                }
+            });
+            result.policy = result.policy.as_ref().map(|_| "<policy-arn>".to_owned());
+        }
+        report.remediation = report
+            .authorization
+            .iter()
+            .filter_map(remediation_for)
+            .collect();
+        report.credential_source = report
+            .credential_source
+            .as_ref()
+            .map(|_| "AWS credentials (details redacted)".to_owned());
+        report.notes = report
+            .notes
+            .iter()
+            .map(|_| "Additional diagnostic detail redacted.".to_owned())
+            .collect();
+        report.notes.dedup();
+        report.notes.push(
+            "Identifiers were redacted; rerun without --redact before sending an access request to an administrator."
+                .to_owned(),
+        );
+        report
     }
 }
 

@@ -179,7 +179,11 @@ fn write_authorization_concise(out: &mut impl Write, report: &AnalysisReport) ->
         )?;
     }
 
-    if let Some(identity) = &report.identity {
+    let has_candidate_policy = report
+        .remediation
+        .iter()
+        .any(|item| item.candidate_policy.is_some());
+    if !has_candidate_policy && let Some(identity) = &report.identity {
         let (label, principal) = match identity.principal_type {
             PrincipalType::AssumedRole | PrincipalType::Role => (
                 "Role",
@@ -221,10 +225,30 @@ fn write_authorization_concise(out: &mut impl Write, report: &AnalysisReport) ->
             recommendation.action == result.action && recommendation.resource == result.resource
         });
         if let Some(policy) = recommendation.and_then(|item| item.candidate_policy.as_ref()) {
-            writeln!(out, "ASK YOUR ADMIN FOR")?;
+            writeln!(out, "SEND TO YOUR AWS ADMIN")?;
+            if let Some(identity) = &report.identity {
+                writeln!(
+                    out,
+                    "  Principal: {}",
+                    identity
+                        .policy_source_arn()
+                        .unwrap_or_else(|| identity.arn.clone())
+                )?;
+            }
+            if let Some(action) = &result.action {
+                writeln!(
+                    out,
+                    "  Missing: {action} on {}",
+                    result
+                        .resource
+                        .as_deref()
+                        .unwrap_or("an unreported resource")
+                )?;
+            }
+            writeln!(out, "\n  Candidate policy (administrator review required):")?;
             let rendered = serde_json::to_string_pretty(policy)?;
             for line in rendered.lines() {
-                writeln!(out, "  {line}")?;
+                writeln!(out, "    {line}")?;
             }
             writeln!(
                 out,

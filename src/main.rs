@@ -26,6 +26,10 @@ enum Commands {
         #[arg(long, conflicts_with = "json")]
         verbose: bool,
 
+        /// Mask account, principal, session, resource, policy, and request identifiers.
+        #[arg(long)]
+        redact: bool,
+
         /// Maximum duration of each follow-up AWS diagnostic call.
         #[arg(long, default_value_t = 5)]
         diagnostic_timeout: u64,
@@ -33,6 +37,12 @@ enum Commands {
         /// The command to execute. Place `--` before it.
         #[arg(last = true, required = true, allow_hyphen_values = true)]
         command: Vec<String>,
+    },
+
+    /// Check credentials and show which aws-why diagnostics are available.
+    Doctor {
+        #[command(flatten)]
+        options: DoctorOptions,
     },
 
     /// Safely simulate whether an IAM action is allowed for one or more resources.
@@ -94,15 +104,44 @@ struct SimulationOptions {
     diagnostic_timeout: u64,
 }
 
+#[derive(Debug, Args)]
+struct DoctorOptions {
+    /// Emit one JSON report on stdout.
+    #[arg(long)]
+    json: bool,
+
+    /// Mask account, principal, and session identifiers.
+    #[arg(long)]
+    redact: bool,
+
+    /// AWS CLI executable or absolute path.
+    #[arg(long, default_value = "aws")]
+    aws_cli: String,
+
+    /// AWS CLI profile used for capability checks.
+    #[arg(long)]
+    profile: Option<String>,
+
+    /// AWS region passed to capability checks.
+    #[arg(long)]
+    region: Option<String>,
+
+    /// Maximum duration of each AWS capability check.
+    #[arg(long, default_value_t = 10)]
+    diagnostic_timeout: u64,
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Commands::Run {
             json,
             verbose,
+            redact,
             diagnostic_timeout,
             command,
-        } => run(command, json, verbose, diagnostic_timeout),
+        } => run(command, json, verbose, redact, diagnostic_timeout),
+        Commands::Doctor { options } => doctor(options),
         Commands::Can {
             action,
             resources,
@@ -253,21 +292,133 @@ fn simulation_error(error: String) -> ExitCode {
     ExitCode::from(2)
 }
 
-fn run(command: Vec<String>, json: bool, verbose: bool, diagnostic_timeout: u64) -> ExitCode {
-    let mut result = match aws_why::runner::run_user_command(&command, !json) {
+fn doctor(options: DoctorOptions) -> ExitCode {
+    let timeout = Duration::from_secs(options.diagnostic_timeout);
+    let context =
+        AwsCommandContext::for_diagnostics(options.aws_cli, options.profile, options.region);
+    let identity = match aws_why::aws::discover_identity(&context, timeout) {
+        Ok(identity) => identity,
+        Err(error) => {
+            let error = if options.redact {
+                "Could not determine the caller identity (detail redacted).".to_owned()
+            } else {
+                error
+            };
+            if options.json {
+                let report = serde_json::json!({
+                    "result": "not_ready",
+                    "credentials": { "available": false, "detail": error },
+                    "run_diagnostics": { "available": false },
+                    "policy_simulation": { "available": false }
+                });
+                let _ = serde_json::to_writer_pretty(io::stdout().lock(), &report);
+                let _ = writeln!(io::stdout());
+            } else {
+                let _ = writeln!(io::stdout(), "AWS-WHY DOCTOR\n");
+                let _ = writeln!(io::stdout(), "- AWS credentials\n  {error}\n");
+                let _ = writeln!(
+                    io::stdout(),
+                    "NOT READY\n  Fix AWS credentials or profile selection, then run doctor again."
+                );
+            }
+            return ExitCode::from(2);
+        }
+    };
+    let simulation = aws_why::aws::simulate_permissions(
+        &context,
+        &identity,
+        &["sts:GetCallerIdentity".to_owned()],
+        &["*".to_owned()],
+        timeout,
+    );
+    let simulation_available = simulation.is_ok();
+    let simulation_detail = simulation.err().map(|detail| {
+        if options.redact {
+            "IAM simulation is unavailable (detail redacted).".to_owned()
+        } else {
+            detail
+        }
+    });
+    let displayed_identity = if options.redact {
+        identity.redacted()
+    } else {
+        identity.clone()
+    };
+    if options.json {
+        let report = serde_json::json!({
+            "result": "ready",
+            "identity": displayed_identity,
+            "credentials": { "available": true },
+            "run_diagnostics": {
+                "available": true,
+                "detail": "AWS-reported denial causes can be explained without IAM simulation."
+            },
+            "policy_simulation": {
+                "available": simulation_available,
+                "detail": simulation_detail
+            }
+        });
+        if serde_json::to_writer_pretty(io::stdout().lock(), &report).is_err() {
+            return ExitCode::from(2);
+        }
+        let _ = writeln!(io::stdout());
+    } else {
+        let principal = displayed_identity
+            .policy_source_arn()
+            .unwrap_or_else(|| displayed_identity.arn.clone());
+        let _ = writeln!(io::stdout(), "AWS-WHY DOCTOR\n");
+        let _ = writeln!(io::stdout(), "+ AWS credentials\n  {principal}\n");
+        let _ = writeln!(
+            io::stdout(),
+            "+ Denial explanations\n  Available. AWS-reported causes do not require IAM simulation.\n"
+        );
+        if simulation_available {
+            let _ = writeln!(
+                io::stdout(),
+                "+ Permission simulation\n  Available for `can` and `permissions`.\n"
+            );
+        } else {
+            let _ = writeln!(
+                io::stdout(),
+                "- Permission simulation (optional)\n  Unavailable. `run` still works; `can` and `permissions` require iam:SimulatePrincipalPolicy.\n"
+            );
+        }
+        let _ = writeln!(
+            io::stdout(),
+            "READY\n  Run: aws-why run -- aws <service> <operation>"
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+fn run(
+    command: Vec<String>,
+    json: bool,
+    verbose: bool,
+    redact: bool,
+    diagnostic_timeout: u64,
+) -> ExitCode {
+    let mut result = match aws_why::runner::run_user_command(&command, !json && !redact) {
         Ok(result) => result,
         Err(error) => {
-            let _ = writeln!(
-                io::stderr(),
-                "aws-why: could not execute {}: {error}",
-                command[0]
-            );
+            if redact {
+                let _ = writeln!(
+                    io::stderr(),
+                    "aws-why: could not execute wrapped command (detail redacted)"
+                );
+            } else {
+                let _ = writeln!(
+                    io::stderr(),
+                    "aws-why: could not execute {}: {error}",
+                    command[0]
+                );
+            }
             return ExitCode::from(126);
         }
     };
 
     if result.exit_code == 0 {
-        if json {
+        if json || redact {
             let _ = result.replay_stdout();
         }
         let _ = result.replay_stderr();
@@ -276,9 +427,10 @@ fn run(command: Vec<String>, json: bool, verbose: bool, diagnostic_timeout: u64)
     }
 
     let report = aws_why::analyze(&result, Duration::from_secs(diagnostic_timeout));
-    if !json && report.failure_kind != aws_why::model::FailureKind::Authorization {
+    if !json && !redact && report.failure_kind != aws_why::model::FailureKind::Authorization {
         let _ = result.replay_stderr();
     }
+    let report = if redact { report.redacted() } else { report };
     let write_result = if json {
         aws_why::output::write_json(&report)
     } else {
