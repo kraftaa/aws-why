@@ -6,34 +6,22 @@
 $ aws-why run -- aws s3 cp test.csv s3://prod-data/test.csv
 upload failed: ... AccessDenied ...
 
-ACCESS DENIED: s3:PutObject on arn:aws:s3:::prod-data/test.csv
+DENIED: s3:PutObject on arn:aws:s3:::prod-data/test.csv
 
-Identity
-  account: 123456789012
-  principal: DataEngineer
-  session: example-session
+Role
+  arn:aws:iam::123456789012:role/DataEngineer
 
-Cause
+Reason
   a permissions boundary blocks the action
 
-Evidence
-  AWS error response (reported by AWS)
-
-AWS already identified this cause; IAM simulation was not required.
-
-What to do next
+NEXT STEP
   An identity-policy Allow alone will not fix this. Ask the boundary owner to
   permit the action, then verify the identity policy also allows it.
-
-Administrator handoff
-  principal: arn:aws:iam::123456789012:role/DataEngineer
-  action: s3:PutObject
-  resource: arn:aws:s3:::prod-data/test.csv
 ```
 
 When AWS reports a missing identity-policy Allow, the handoff also includes a narrowly scoped candidate policy for administrator review. It is never applied automatically. Explicit denies, permissions boundaries, SCPs, resource policies, and other restrictive layers receive cause-specific guidance instead of an ineffective Allow recommendation.
 
-The normal `run` workflow does not require IAM simulator access. When AWS's error already states the cause, `aws-why` says so and does not present unavailable simulation as missing evidence. The tool also does not treat every AWS failure as IAM: expired credentials, missing configuration, network errors, and missing resources get distinct results.
+The normal `run` workflow does not require IAM simulator access. Its default output contains only the denied request, attachable principal, reason, and next action. Add `--verbose` to include the session identity, evidence source, credential source, and diagnostic notes; use `--json` for the complete machine-readable report. The tool also does not treat every AWS failure as IAM: expired credentials, missing configuration, network errors, and missing resources get distinct results.
 
 ## Install and use
 

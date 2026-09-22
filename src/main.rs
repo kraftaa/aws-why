@@ -22,6 +22,10 @@ enum Commands {
         #[arg(long)]
         json: bool,
 
+        /// Include identity session, evidence, credential source, and diagnostic notes.
+        #[arg(long, conflicts_with = "json")]
+        verbose: bool,
+
         /// Maximum duration of each follow-up AWS diagnostic call.
         #[arg(long, default_value_t = 5)]
         diagnostic_timeout: u64,
@@ -95,9 +99,10 @@ fn main() -> ExitCode {
     match cli.command {
         Commands::Run {
             json,
+            verbose,
             diagnostic_timeout,
             command,
-        } => run(command, json, diagnostic_timeout),
+        } => run(command, json, verbose, diagnostic_timeout),
         Commands::Can {
             action,
             resources,
@@ -248,7 +253,7 @@ fn simulation_error(error: String) -> ExitCode {
     ExitCode::from(2)
 }
 
-fn run(command: Vec<String>, json: bool, diagnostic_timeout: u64) -> ExitCode {
+fn run(command: Vec<String>, json: bool, verbose: bool, diagnostic_timeout: u64) -> ExitCode {
     let mut result = match aws_why::runner::run_user_command(&command, !json) {
         Ok(result) => result,
         Err(error) => {
@@ -277,7 +282,7 @@ fn run(command: Vec<String>, json: bool, diagnostic_timeout: u64) -> ExitCode {
     let write_result = if json {
         aws_why::output::write_json(&report)
     } else {
-        aws_why::output::write_human(&report)
+        aws_why::output::write_human(&report, verbose)
     };
     if let Err(error) = write_result {
         let _ = writeln!(io::stderr(), "aws-why: could not write diagnostic: {error}");

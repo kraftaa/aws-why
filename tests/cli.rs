@@ -122,6 +122,25 @@ fn invoke_with_args(scenario: &str, json: bool, extra: &[&str]) -> Output {
     command.env("FAKE_SCENARIO", scenario).output().unwrap()
 }
 
+fn invoke_verbose(scenario: &str) -> Output {
+    let directory = fake_aws();
+    let aws = directory.path().join("aws");
+    Command::new(env!("CARGO_BIN_EXE_aws-why"))
+        .args([
+            "run",
+            "--verbose",
+            "--",
+            aws.to_str().unwrap(),
+            "s3",
+            "cp",
+            "x.csv",
+            "s3://prod-data/x.csv",
+        ])
+        .env("FAKE_SCENARIO", scenario)
+        .output()
+        .unwrap()
+}
+
 #[test]
 fn successful_command_is_transparent_and_quiet() {
     let output = invoke("success", false);
@@ -143,11 +162,11 @@ fn identifies_boundary_from_live_error() {
     let output = invoke("boundary", false);
     assert_eq!(output.status.code(), Some(254));
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("ACCESS DENIED"));
+    assert!(stderr.contains("DENIED: s3:PutObject"));
     assert!(stderr.contains("s3:PutObject"));
     assert!(stderr.contains("a permissions boundary blocks the action"));
-    assert!(stderr.contains("AWS error response (reported by AWS)"));
-    assert!(!stderr.contains("Not a guess"));
+    assert!(stderr.contains("NEXT STEP"));
+    assert!(!stderr.contains("Evidence"));
 }
 
 #[test]
@@ -164,7 +183,6 @@ fn insufficient_evidence_is_unknown() {
     let output = invoke("unknown", false);
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("the exact denial reason is unknown"));
-    assert!(stderr.contains("incomplete"));
     assert!(stderr.contains("simulation was unavailable or not permitted"));
 }
 
@@ -192,14 +210,27 @@ fn names_missing_s3_permission() {
 fn turns_conclusive_denial_into_an_admin_handoff() {
     let output = invoke("kms_list", false);
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("ACCESS DENIED: kms:ListKeys on *"));
-    assert!(stderr.contains("AWS already identified this cause"));
-    assert!(stderr.contains("Administrator handoff"));
+    assert!(stderr.contains("DENIED: kms:ListKeys on *"));
     assert!(stderr.contains("arn:aws:iam::111111111111:role/DataEngineer"));
-    assert!(stderr.contains("Candidate policy (administrator review required)"));
+    assert!(stderr.contains("ASK YOUR ADMIN FOR"));
     assert!(stderr.contains("\"Action\": \"kms:ListKeys\""));
     assert!(stderr.contains("\"Resource\": \"*\""));
+    assert!(!stderr.contains("Evidence"));
+    assert!(!stderr.contains("Credential source"));
+    assert!(!stderr.contains("session:"));
     assert!(!stderr.contains("could not obtain complete AWS authorization details"));
+}
+
+#[test]
+fn verbose_mode_keeps_forensic_details() {
+    let output = invoke_verbose("kms_list");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("ACCESS DENIED: kms:ListKeys on *"));
+    assert!(stderr.contains("session: example-session"));
+    assert!(stderr.contains("Evidence"));
+    assert!(stderr.contains("AWS error response (reported by AWS)"));
+    assert!(stderr.contains("Credential source"));
+    assert!(stderr.contains("Administrator handoff"));
 }
 
 #[test]
@@ -264,7 +295,7 @@ fn custom_endpoint_command_never_triggers_follow_up_calls() {
 fn raw_encoded_authorization_payload_is_not_replayed() {
     let output = invoke("encoded", false);
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("ACCESS DENIED"));
+    assert!(stderr.contains("DENIED"));
     assert!(!stderr.contains("SUPERSECRETENCODEDPAYLOAD"));
 }
 

@@ -2,6 +2,7 @@ use std::io::{self, Write};
 
 use crate::model::{
     AnalysisReport, Confidence, Decision, DenyCause, EvidenceSource, FailureKind, PermissionReport,
+    PrincipalType,
 };
 
 pub fn write_json(report: &AnalysisReport) -> io::Result<()> {
@@ -89,11 +90,12 @@ pub fn write_permission_human(report: &PermissionReport) -> io::Result<()> {
     )
 }
 
-pub fn write_human(report: &AnalysisReport) -> io::Result<()> {
+pub fn write_human(report: &AnalysisReport, verbose: bool) -> io::Result<()> {
     let stderr = io::stderr();
     let mut out = stderr.lock();
     match report.failure_kind {
-        FailureKind::Authorization => write_authorization(&mut out, report),
+        FailureKind::Authorization if verbose => write_authorization_verbose(&mut out, report),
+        FailureKind::Authorization => write_authorization_concise(&mut out, report),
         FailureKind::Authentication => {
             writeln!(out, "\nAUTHENTICATION FAILURE\n")?;
             if report.error.as_ref().is_some_and(|error| {
@@ -148,7 +150,106 @@ fn write_simple(
     writeln!(out, "{conclusion}")
 }
 
-fn write_authorization(out: &mut impl Write, report: &AnalysisReport) -> io::Result<()> {
+fn write_authorization_concise(out: &mut impl Write, report: &AnalysisReport) -> io::Result<()> {
+    if report.authorization.is_empty() {
+        writeln!(out, "\nACCESS DENIED\n")?;
+        if let Some(error) = &report.error {
+            writeln!(out, "{}: {}\n", error.code, error.message)?;
+        }
+        writeln!(out, "Exact denial reason unknown.")?;
+        write_important_notes(out, report)?;
+        return Ok(());
+    }
+
+    if report.authorization.len() == 1 {
+        let result = &report.authorization[0];
+        write!(out, "\nDENIED")?;
+        if let Some(action) = &result.action {
+            write!(out, ": {action}")?;
+        }
+        if let Some(resource) = &result.resource {
+            write!(out, " on {resource}")?;
+        }
+        writeln!(out, "\n")?;
+    } else {
+        writeln!(
+            out,
+            "\nDENIED: {} authorization checks\n",
+            report.authorization.len()
+        )?;
+    }
+
+    if let Some(identity) = &report.identity {
+        let (label, principal) = match identity.principal_type {
+            PrincipalType::AssumedRole | PrincipalType::Role => (
+                "Role",
+                identity
+                    .policy_source_arn()
+                    .unwrap_or_else(|| identity.arn.clone()),
+            ),
+            PrincipalType::User => ("User", identity.arn.clone()),
+            _ => ("Principal", identity.arn.clone()),
+        };
+        writeln!(out, "{label}")?;
+        writeln!(out, "  {principal}\n")?;
+    }
+
+    for (index, result) in report.authorization.iter().enumerate() {
+        if report.authorization.len() > 1 {
+            writeln!(out, "Request {}", index + 1)?;
+            writeln!(
+                out,
+                "  action: {}",
+                result.action.as_deref().unwrap_or("unknown")
+            )?;
+            writeln!(
+                out,
+                "  resource: {}\n",
+                result.resource.as_deref().unwrap_or("not reported by AWS")
+            )?;
+        }
+        if let Some(cause) = &result.cause {
+            writeln!(out, "Reason")?;
+            writeln!(out, "  {}", cause.label())?;
+            if let Some(policy) = &result.policy {
+                writeln!(out, "  policy: {policy}")?;
+            }
+            writeln!(out)?;
+        }
+
+        let recommendation = report.remediation.iter().find(|recommendation| {
+            recommendation.action == result.action && recommendation.resource == result.resource
+        });
+        if let Some(policy) = recommendation.and_then(|item| item.candidate_policy.as_ref()) {
+            writeln!(out, "ASK YOUR ADMIN FOR")?;
+            let rendered = serde_json::to_string_pretty(policy)?;
+            for line in rendered.lines() {
+                writeln!(out, "  {line}")?;
+            }
+            writeln!(
+                out,
+                "\nCandidate only—administrator review required; other policy layers may still deny the request.\n"
+            )?;
+        } else if let Some(recommendation) = recommendation {
+            writeln!(out, "NEXT STEP")?;
+            writeln!(out, "  {}\n", recommendation.guidance)?;
+        }
+    }
+    write_important_notes(out, report)
+}
+
+fn write_important_notes(out: &mut impl Write, report: &AnalysisReport) -> io::Result<()> {
+    if !report.notes.is_empty() {
+        writeln!(out, "Important")?;
+        for note in &report.notes {
+            writeln!(out, "  {note}")?;
+        }
+        writeln!(out)?;
+    }
+    Ok(())
+}
+
+fn write_authorization_verbose(out: &mut impl Write, report: &AnalysisReport) -> io::Result<()> {
     write!(out, "\nACCESS DENIED")?;
     if report.authorization.len() == 1
         && let Some(action) = &report.authorization[0].action
