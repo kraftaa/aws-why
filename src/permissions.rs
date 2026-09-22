@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::time::Duration;
 
+use regex::Regex;
 use serde::Deserialize;
 
 const SERVICE_INDEX_URL: &str =
@@ -13,18 +15,74 @@ struct ServiceIndexEntry {
     url: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct ServiceReference {
     #[serde(rename = "Name")]
     name: String,
     #[serde(rename = "Actions")]
     actions: Vec<ServiceAction>,
+    #[serde(default, rename = "Resources")]
+    resources: Vec<ServiceResource>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct ServiceAction {
     #[serde(rename = "Name")]
     name: String,
+    #[serde(default, rename = "Resources")]
+    resources: Vec<ActionResource>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ActionResource {
+    #[serde(rename = "Name")]
+    name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ServiceResource {
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(default, rename = "ARNFormats")]
+    arn_formats: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceValidation {
+    pub valid: bool,
+    pub detail: String,
+    pub resource_types: Vec<String>,
+}
+
+pub struct ResourceValidator {
+    timeout: Duration,
+    references: HashMap<String, Result<ServiceReference, String>>,
+}
+
+impl ResourceValidator {
+    pub fn new(timeout: Duration) -> Self {
+        Self {
+            timeout,
+            references: HashMap::new(),
+        }
+    }
+
+    pub fn validate(&mut self, action: &str, resource: &str) -> Result<ResourceValidation, String> {
+        let action = normalize_action(action, None)?;
+        let (service, action_name) = action
+            .split_once(':')
+            .ok_or_else(|| format!("Invalid IAM action: {action}"))?;
+        if !self.references.contains_key(service) {
+            self.references.insert(
+                service.to_owned(),
+                fetch_service_reference(service, self.timeout),
+            );
+        }
+        match self.references.get(service).expect("inserted above") {
+            Ok(reference) => validate_from_reference(reference, action_name, resource),
+            Err(error) => Err(error.clone()),
+        }
+    }
 }
 
 pub fn normalize_service(service: &str) -> Result<String, String> {
@@ -99,6 +157,29 @@ pub fn normalize_resources(resources: Vec<String>) -> Result<Vec<String>, String
 
 pub fn fetch_service_actions(service: &str, timeout: Duration) -> Result<Vec<String>, String> {
     let service = normalize_service(service)?;
+    let reference = fetch_service_reference(&service, timeout)?;
+    let mut actions = reference
+        .actions
+        .into_iter()
+        .map(|action| format!("{service}:{}", action.name))
+        .collect::<Vec<_>>();
+    actions.sort_unstable();
+    actions.dedup();
+    if actions.is_empty() {
+        return Err(format!("AWS listed no IAM actions for {service}."));
+    }
+    Ok(actions)
+}
+
+pub fn validate_candidate_resource(
+    action: &str,
+    resource: &str,
+    timeout: Duration,
+) -> Result<ResourceValidation, String> {
+    ResourceValidator::new(timeout).validate(action, resource)
+}
+
+fn fetch_service_reference(service: &str, timeout: Duration) -> Result<ServiceReference, String> {
     let config = ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
         .build();
@@ -118,22 +199,112 @@ pub fn fetch_service_actions(service: &str, timeout: Duration) -> Result<Vec<Str
     let reference_body = get_text(&agent, &entry.url)?;
     let reference: ServiceReference = serde_json::from_str(&reference_body)
         .map_err(|_| format!("AWS returned unreadable authorization data for {service}."))?;
-    if !reference.name.eq_ignore_ascii_case(&service) {
+    if !reference.name.eq_ignore_ascii_case(service) {
         return Err(
             "AWS service-reference response did not match the requested service.".to_owned(),
         );
     }
-    let mut actions = reference
+    Ok(reference)
+}
+
+fn validate_from_reference(
+    reference: &ServiceReference,
+    action_name: &str,
+    resource: &str,
+) -> Result<ResourceValidation, String> {
+    let action = reference
         .actions
-        .into_iter()
-        .map(|action| format!("{service}:{}", action.name))
+        .iter()
+        .find(|action| action.name.eq_ignore_ascii_case(action_name))
+        .ok_or_else(|| {
+            format!(
+                "AWS Service Authorization Reference has no action named {}:{action_name}.",
+                reference.name
+            )
+        })?;
+    let mut resource_types = action
+        .resources
+        .iter()
+        .map(|item| item.name.clone())
         .collect::<Vec<_>>();
-    actions.sort_unstable();
-    actions.dedup();
-    if actions.is_empty() {
-        return Err(format!("AWS listed no IAM actions for {service}."));
+    resource_types.sort_unstable();
+    resource_types.dedup();
+
+    if action.resources.is_empty() {
+        return Ok(ResourceValidation {
+            valid: resource == "*",
+            detail: if resource == "*" {
+                "AWS lists this action without resource-level permissions; Resource \"*\" is required."
+                    .to_owned()
+            } else {
+                "AWS lists this action without resource-level permissions, so the reported ARN cannot scope an Allow; Resource \"*\" is required."
+                    .to_owned()
+            },
+            resource_types,
+        });
     }
-    Ok(actions)
+
+    if resource == "*" {
+        return Ok(ResourceValidation {
+            valid: true,
+            detail: format!(
+                "AWS supports resource types {}; Resource \"*\" is valid but broad.",
+                resource_types.join(", ")
+            ),
+            resource_types,
+        });
+    }
+
+    let formats = action
+        .resources
+        .iter()
+        .flat_map(|action_resource| {
+            reference
+                .resources
+                .iter()
+                .filter(move |resource| resource.name == action_resource.name)
+                .flat_map(|resource| resource.arn_formats.iter())
+        })
+        .collect::<Vec<_>>();
+    let valid = formats
+        .iter()
+        .any(|format| arn_template_matches(format, resource));
+    Ok(ResourceValidation {
+        valid,
+        detail: if valid {
+            format!(
+                "The reported resource matches AWS resource type {}.",
+                resource_types.join(" or ")
+            )
+        } else {
+            format!(
+                "The reported resource does not match the AWS resource types supported by this action: {}. No candidate policy was generated.",
+                resource_types.join(", ")
+            )
+        },
+        resource_types,
+    })
+}
+
+fn arn_template_matches(template: &str, resource: &str) -> bool {
+    let mut pattern = String::from("^");
+    let mut remaining = template;
+    while let Some(start) = remaining.find("${") {
+        pattern.push_str(&regex::escape(&remaining[..start]));
+        let placeholder = &remaining[start + 2..];
+        let Some(end) = placeholder.find('}') else {
+            return false;
+        };
+        pattern.push_str(match &placeholder[..end] {
+            "Partition" => r"[^:]+",
+            "Region" | "Account" => r"[^:]*",
+            _ => r"[^\s]+",
+        });
+        remaining = &placeholder[end + 1..];
+    }
+    pattern.push_str(&regex::escape(remaining));
+    pattern.push('$');
+    Regex::new(&pattern).is_ok_and(|regex| regex.is_match(resource))
 }
 
 fn get_text(agent: &ureq::Agent, url: &str) -> Result<String, String> {
@@ -150,7 +321,7 @@ fn get_text(agent: &ureq::Agent, url: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_action, normalize_service};
+    use super::{ServiceReference, normalize_action, normalize_service, validate_from_reference};
 
     #[test]
     fn normalizes_actions_with_and_without_prefixes() {
@@ -169,5 +340,42 @@ mod tests {
     fn rejects_service_url_injection() {
         assert!(normalize_service("s3/../../example").is_err());
         assert!(normalize_service("S3").is_ok());
+    }
+
+    #[test]
+    fn validates_resource_shapes_from_aws_reference_data() {
+        let reference: ServiceReference = serde_json::from_str(
+            r#"{
+              "Name":"s3",
+              "Actions":[
+                {"Name":"GetObject","Resources":[{"Name":"object"}]},
+                {"Name":"ListAllMyBuckets"}
+              ],
+              "Resources":[
+                {"Name":"object","ARNFormats":["arn:${Partition}:s3:::${BucketName}/${ObjectName}"]}
+              ]
+            }"#,
+        )
+        .unwrap();
+        assert!(
+            validate_from_reference(&reference, "GetObject", "arn:aws:s3:::bucket/key")
+                .unwrap()
+                .valid
+        );
+        assert!(
+            !validate_from_reference(&reference, "GetObject", "arn:aws:s3:::bucket")
+                .unwrap()
+                .valid
+        );
+        assert!(
+            validate_from_reference(&reference, "ListAllMyBuckets", "*")
+                .unwrap()
+                .valid
+        );
+        assert!(
+            !validate_from_reference(&reference, "ListAllMyBuckets", "arn:aws:s3:::bucket")
+                .unwrap()
+                .valid
+        );
     }
 }

@@ -306,6 +306,24 @@ pub struct Remediation {
     pub guidance: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub candidate_policy: Option<CandidatePolicy>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_validation: Option<PolicyValidation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyValidationStatus {
+    Valid,
+    Invalid,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PolicyValidation {
+    pub status: PolicyValidationStatus,
+    pub detail: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resource_types: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -406,11 +424,22 @@ impl AnalysisReport {
             });
             result.policy = result.policy.as_ref().map(|_| "<policy-arn>".to_owned());
         }
-        report.remediation = report
-            .authorization
-            .iter()
-            .filter_map(remediation_for)
-            .collect();
+        for remediation in &mut report.remediation {
+            remediation.resource = remediation.resource.as_ref().map(|resource| {
+                if resource == "*" {
+                    "*".to_owned()
+                } else {
+                    "<resource>".to_owned()
+                }
+            });
+            if let Some(policy) = remediation.candidate_policy.as_mut() {
+                for statement in &mut policy.statement {
+                    if statement.resource != "*" {
+                        statement.resource = "<resource>".to_owned();
+                    }
+                }
+            }
+        }
         report.credential_source = report
             .credential_source
             .as_ref()
@@ -426,6 +455,30 @@ impl AnalysisReport {
                 .to_owned(),
         );
         report
+    }
+
+    pub fn set_policy_validation(
+        &mut self,
+        action: &str,
+        resource: &str,
+        mut validation: PolicyValidation,
+    ) {
+        validation.detail = sanitize_generated_text(&validation.detail);
+        validation.resource_types = validation
+            .resource_types
+            .iter()
+            .map(|item| sanitize_generated_text(item))
+            .collect();
+        if let Some(remediation) = self.remediation.iter_mut().find(|item| {
+            item.action.as_deref() == Some(action) && item.resource.as_deref() == Some(resource)
+        }) {
+            if validation.status == PolicyValidationStatus::Invalid {
+                remediation.candidate_policy = None;
+                remediation.guidance = "Confirm the intended resource with an administrator before changing policy; AWS does not support this action on the reported resource type."
+                    .to_owned();
+            }
+            remediation.policy_validation = Some(validation);
+        }
     }
 }
 
@@ -488,6 +541,7 @@ fn remediation_for(result: &AuthorizationResult) -> Option<Remediation> {
         resource: result.resource.clone(),
         guidance: guidance.to_owned(),
         candidate_policy,
+        policy_validation: None,
     })
 }
 
@@ -541,7 +595,10 @@ pub(crate) fn sanitize_generated_text(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_generated_text;
+    use super::{
+        AnalysisReport, AuthorizationResult, Confidence, Decision, DenyCause, EvidenceSource,
+        FailureKind, PolicyValidation, PolicyValidationStatus, sanitize_generated_text,
+    };
 
     #[test]
     fn redacts_encoded_authorization_payloads() {
@@ -559,5 +616,47 @@ mod tests {
         assert!(!output.contains(&access_key));
         assert!(!output.contains("secret-token"));
         assert!(!output.contains('\x1b'));
+    }
+
+    #[test]
+    fn invalid_resource_validation_withholds_candidate_policy() {
+        let authorization = vec![AuthorizationResult {
+            action: Some("s3:GetObject".to_owned()),
+            resource: Some("arn:aws:s3:::bucket".to_owned()),
+            decision: Decision::ImplicitDeny,
+            cause: Some(DenyCause::MissingIdentityAllow),
+            policy: None,
+            evidence_source: EvidenceSource::AwsError,
+            confidence: Confidence::Reported,
+            missing_context: Vec::new(),
+        }];
+        let mut report = AnalysisReport::from_parts(
+            1,
+            FailureKind::Authorization,
+            None,
+            None,
+            authorization,
+            Vec::new(),
+            None,
+        );
+        assert!(report.remediation[0].candidate_policy.is_some());
+        report.set_policy_validation(
+            "s3:GetObject",
+            "arn:aws:s3:::bucket",
+            PolicyValidation {
+                status: PolicyValidationStatus::Invalid,
+                detail: "resource mismatch".to_owned(),
+                resource_types: vec!["object".to_owned()],
+            },
+        );
+        assert!(report.remediation[0].candidate_policy.is_none());
+        assert_eq!(
+            report.remediation[0]
+                .policy_validation
+                .as_ref()
+                .unwrap()
+                .status,
+            PolicyValidationStatus::Invalid
+        );
     }
 }

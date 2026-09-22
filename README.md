@@ -19,7 +19,7 @@ NEXT STEP
   permit the action, then verify the identity policy also allows it.
 ```
 
-When AWS reports a missing identity-policy Allow, the handoff also includes a narrowly scoped candidate policy for administrator review. It is never applied automatically. Explicit denies, permissions boundaries, SCPs, resource policies, and other restrictive layers receive cause-specific guidance instead of an ineffective Allow recommendation.
+When AWS reports a missing identity-policy Allow, the handoff also includes a narrowly scoped candidate policy for administrator review. Before showing it, `run` checks the action and resource shape against AWS's public Service Authorization Reference. A confirmed mismatch suppresses the policy instead of suggesting an invalid grant. Policies are never applied automatically. Explicit denies, permissions boundaries, SCPs, resource policies, and other restrictive layers receive cause-specific guidance instead of an ineffective Allow recommendation.
 
 The normal `run` workflow does not require IAM simulator access. Its default output contains only the denied request, attachable principal, reason, and next action. Add `--verbose` to include the session identity, evidence source, credential source, and diagnostic notes; use `--json` for the complete machine-readable report. The tool also does not treat every AWS failure as IAM: expired credentials, missing configuration, network errors, and missing resources get distinct results.
 
@@ -31,6 +31,7 @@ The normal installation does not require Rust or Cargo. Install the native execu
 pipx install aws-why
 aws-why doctor
 aws-why run -- aws sts get-caller-identity
+aws-why explain aws-error.txt
 aws-why run --json -- aws s3api get-object --bucket example --key report.csv report.csv
 ```
 
@@ -41,6 +42,29 @@ uv tool install aws-why
 ```
 
 Release wheels contain the compiled executable; Python is only the distribution mechanism. Wheels are built for macOS on Apple Silicon and Intel, Linux on ARM64 and x86-64, and Windows x86-64.
+
+## Explain an error without rerunning it
+
+Analyze a saved AWS CLI error from a log, CI artifact, or another machine:
+
+```console
+aws kms list-keys 2> aws-error.txt
+aws-why explain aws-error.txt
+```
+
+Or pipe an error through stdin:
+
+```console
+aws-why explain - < aws-error.txt
+```
+
+`explain` never reruns the failed command and never uses AWS credentials. By default it is fully offline. Add `--validate-policy` to check a generated policy's resource scope against AWS's public Service Authorization Reference; this makes unauthenticated HTTPS requests but sends no AWS credentials. `--json`, `--verbose`, and `--redact` work the same way as they do with `run`.
+
+## Validate candidate-policy resources
+
+`run` validates generated policy resources by default. For example, AWS's reference says `kms:ListKeys` requires `"Resource": "*"`, while `s3:GetObject` accepts object or access-point-object ARNs rather than a bare bucket ARN. The output labels a resource check as `verified`, `mismatch`, or `not verified`. A confirmed mismatch removes the candidate policy; a temporarily unavailable catalog leaves the candidate in place with an explicit warning for administrator review.
+
+The catalog does not currently expose dependent-action metadata. `aws-why` therefore reports dependencies only when the live AWS error identifies them—for example, a `kms:Decrypt` denial encountered while reading a Secrets Manager secret—instead of guessing. Use `run --no-policy-validation` to disable the public catalog request.
 
 ## Check your setup
 
@@ -130,7 +154,7 @@ The command after `--` is executed with exactly the supplied argument vector and
 
 In `--json` mode, successful command output is replayed from secure temporary files. For failures, command output is replaced with one JSON diagnostic object on stdout so CI consumers can parse it reliably. Replay is capped at 64 MiB for stdout and 8 MiB for stderr; analysis retains only the final 1 MiB of stderr.
 
-Each follow-up AWS call has a five-second timeout by default. Change it with `--diagnostic-timeout <seconds>`.
+Each credentialed follow-up AWS call has a five-second timeout by default. Change it with `--diagnostic-timeout <seconds>`. Public candidate-policy validation is capped at two seconds so an unavailable catalog does not substantially delay the denial report.
 
 ## Evidence hierarchy
 
@@ -164,7 +188,7 @@ AWS may require these permissions for stronger explanations:
 - `sts:DecodeAuthorizationMessage`
 - `iam:SimulatePrincipalPolicy`
 
-The `can` and `permissions` commands require `sts:GetCallerIdentity` and `iam:SimulatePrincipalPolicy`. Service-wide `permissions` also makes an unauthenticated HTTPS request to `servicereference.us-east-1.amazonaws.com`; no AWS credentials are sent to that catalog endpoint. Passing one or more explicit `--action` values skips the catalog request.
+The `can` and `permissions` commands require `sts:GetCallerIdentity` and `iam:SimulatePrincipalPolicy`. Policy validation and service-wide `permissions` make unauthenticated HTTPS requests to `servicereference.us-east-1.amazonaws.com`; no AWS credentials are sent to that catalog endpoint. Passing one or more explicit `--action` values skips the catalog request for `permissions`.
 
 The original command still runs if none of those diagnostic permissions are available; the result simply becomes less specific.
 

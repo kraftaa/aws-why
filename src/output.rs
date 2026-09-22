@@ -2,7 +2,7 @@ use std::io::{self, Write};
 
 use crate::model::{
     AnalysisReport, Confidence, Decision, DenyCause, EvidenceSource, FailureKind, PermissionReport,
-    PrincipalType,
+    PolicyValidation, PolicyValidationStatus, PrincipalType,
 };
 
 pub fn write_json(report: &AnalysisReport) -> io::Result<()> {
@@ -93,9 +93,19 @@ pub fn write_permission_human(report: &PermissionReport) -> io::Result<()> {
 pub fn write_human(report: &AnalysisReport, verbose: bool) -> io::Result<()> {
     let stderr = io::stderr();
     let mut out = stderr.lock();
+    write_human_to(&mut out, report, verbose)
+}
+
+pub fn write_human_stdout(report: &AnalysisReport, verbose: bool) -> io::Result<()> {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    write_human_to(&mut out, report, verbose)
+}
+
+fn write_human_to(out: &mut impl Write, report: &AnalysisReport, verbose: bool) -> io::Result<()> {
     match report.failure_kind {
-        FailureKind::Authorization if verbose => write_authorization_verbose(&mut out, report),
-        FailureKind::Authorization => write_authorization_concise(&mut out, report),
+        FailureKind::Authorization if verbose => write_authorization_verbose(out, report),
+        FailureKind::Authorization => write_authorization_concise(out, report),
         FailureKind::Authentication => {
             writeln!(out, "\nAUTHENTICATION FAILURE\n")?;
             if report.error.as_ref().is_some_and(|error| {
@@ -111,25 +121,25 @@ pub fn write_human(report: &AnalysisReport, verbose: bool) -> io::Result<()> {
             )
         }
         FailureKind::Configuration => write_simple(
-            &mut out,
+            out,
             "AWS CONFIGURATION FAILURE",
             report,
             "Fix the local AWS CLI configuration before investigating IAM.",
         ),
         FailureKind::Network => write_simple(
-            &mut out,
+            out,
             "AWS NETWORK FAILURE",
             report,
             "The request did not produce evidence of an IAM denial.",
         ),
         FailureKind::ResourceNotFound => write_simple(
-            &mut out,
+            out,
             "AWS RESOURCE NOT FOUND",
             report,
             "This is not evidence that an IAM permission is missing.",
         ),
         FailureKind::Other => write_simple(
-            &mut out,
+            out,
             "COMMAND FAILED",
             report,
             "aws-why found no reliable evidence of an IAM denial.",
@@ -257,6 +267,9 @@ fn write_authorization_concise(out: &mut impl Write, report: &AnalysisReport) ->
         } else if let Some(recommendation) = recommendation {
             writeln!(out, "NEXT STEP")?;
             writeln!(out, "  {}\n", recommendation.guidance)?;
+        }
+        if let Some(validation) = recommendation.and_then(|item| item.policy_validation.as_ref()) {
+            write_policy_validation(out, validation)?;
         }
     }
     write_important_notes(out, report)
@@ -394,6 +407,9 @@ fn write_authorization_verbose(out: &mut impl Write, report: &AnalysisReport) ->
                 "  This addresses the reported denial only; another policy layer may still block the request.\n"
             )?;
         }
+        if let Some(validation) = &recommendation.policy_validation {
+            write_policy_validation(out, validation)?;
+        }
     }
     if !report.notes.is_empty() {
         writeln!(out, "Notes")?;
@@ -417,6 +433,16 @@ fn write_authorization_verbose(out: &mut impl Write, report: &AnalysisReport) ->
         )?;
     }
     Ok(())
+}
+
+fn write_policy_validation(out: &mut impl Write, validation: &PolicyValidation) -> io::Result<()> {
+    writeln!(out, "Policy resource check")?;
+    let marker = match validation.status {
+        PolicyValidationStatus::Valid => "verified",
+        PolicyValidationStatus::Invalid => "mismatch",
+        PolicyValidationStatus::Unavailable => "not verified",
+    };
+    writeln!(out, "  {marker}: {}\n", validation.detail)
 }
 
 fn source_label(source: &EvidenceSource) -> &'static str {

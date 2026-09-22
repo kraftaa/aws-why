@@ -1,4 +1,5 @@
-use std::io::{self, Write};
+use std::fs::File;
+use std::io::{self, Read, Write};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -30,6 +31,10 @@ enum Commands {
         #[arg(long)]
         redact: bool,
 
+        /// Skip the public AWS resource-scope check for generated policies.
+        #[arg(long)]
+        no_policy_validation: bool,
+
         /// Maximum duration of each follow-up AWS diagnostic call.
         #[arg(long, default_value_t = 5)]
         diagnostic_timeout: u64,
@@ -37,6 +42,33 @@ enum Commands {
         /// The command to execute. Place `--` before it.
         #[arg(last = true, required = true, allow_hyphen_values = true)]
         command: Vec<String>,
+    },
+
+    /// Explain a saved AWS CLI error from a file or stdin without rerunning it.
+    Explain {
+        /// Error file to analyze, or - for stdin.
+        #[arg(default_value = "-", value_name = "FILE")]
+        input: String,
+
+        /// Emit one JSON diagnostic object.
+        #[arg(long)]
+        json: bool,
+
+        /// Include evidence and diagnostic detail.
+        #[arg(long, conflicts_with = "json")]
+        verbose: bool,
+
+        /// Mask account, principal, session, resource, policy, and request identifiers.
+        #[arg(long)]
+        redact: bool,
+
+        /// Validate a generated policy against AWS's public authorization reference.
+        #[arg(long)]
+        validate_policy: bool,
+
+        /// Maximum duration of the optional public policy-validation request.
+        #[arg(long, default_value_t = 2)]
+        diagnostic_timeout: u64,
     },
 
     /// Check credentials and show which aws-why diagnostics are available.
@@ -138,9 +170,32 @@ fn main() -> ExitCode {
             json,
             verbose,
             redact,
+            no_policy_validation,
             diagnostic_timeout,
             command,
-        } => run(command, json, verbose, redact, diagnostic_timeout),
+        } => run(
+            command,
+            json,
+            verbose,
+            redact,
+            no_policy_validation,
+            diagnostic_timeout,
+        ),
+        Commands::Explain {
+            input,
+            json,
+            verbose,
+            redact,
+            validate_policy,
+            diagnostic_timeout,
+        } => explain(
+            input,
+            json,
+            verbose,
+            redact,
+            validate_policy,
+            diagnostic_timeout,
+        ),
         Commands::Doctor { options } => doctor(options),
         Commands::Can {
             action,
@@ -391,11 +446,80 @@ fn doctor(options: DoctorOptions) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn explain(
+    input: String,
+    json: bool,
+    verbose: bool,
+    redact: bool,
+    validate_policy: bool,
+    diagnostic_timeout: u64,
+) -> ExitCode {
+    let raw = match read_error_input(&input) {
+        Ok(raw) if !raw.iter().all(u8::is_ascii_whitespace) => raw,
+        Ok(_) => {
+            let _ = writeln!(io::stderr(), "aws-why: no error text was provided");
+            return ExitCode::from(2);
+        }
+        Err(error) => {
+            if redact {
+                let _ = writeln!(
+                    io::stderr(),
+                    "aws-why: could not read error input (detail redacted)"
+                );
+            } else {
+                let _ = writeln!(io::stderr(), "aws-why: could not read {input}: {error}");
+            }
+            return ExitCode::from(2);
+        }
+    };
+    let mut report = aws_why::analyze_text(&raw);
+    if validate_policy {
+        aws_why::validate_candidate_policies(
+            &mut report,
+            policy_validation_timeout(diagnostic_timeout),
+        );
+    }
+    let report = if redact { report.redacted() } else { report };
+    let result = if json {
+        aws_why::output::write_json(&report)
+    } else {
+        aws_why::output::write_human_stdout(&report, verbose)
+    };
+    if let Err(error) = result {
+        let _ = writeln!(io::stderr(), "aws-why: could not write diagnostic: {error}");
+        return ExitCode::from(2);
+    }
+    ExitCode::SUCCESS
+}
+
+fn read_error_input(input: &str) -> io::Result<Vec<u8>> {
+    const INPUT_LIMIT: u64 = 8 * 1024 * 1024;
+    let reader: Box<dyn Read> = if input == "-" {
+        Box::new(io::stdin())
+    } else {
+        Box::new(File::open(input)?)
+    };
+    let mut raw = Vec::new();
+    reader.take(INPUT_LIMIT + 1).read_to_end(&mut raw)?;
+    if raw.len() as u64 > INPUT_LIMIT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "input exceeds the 8 MiB limit",
+        ));
+    }
+    Ok(raw)
+}
+
+fn policy_validation_timeout(requested_seconds: u64) -> Duration {
+    Duration::from_secs(requested_seconds.clamp(1, 2))
+}
+
 fn run(
     command: Vec<String>,
     json: bool,
     verbose: bool,
     redact: bool,
+    no_policy_validation: bool,
     diagnostic_timeout: u64,
 ) -> ExitCode {
     let mut result = match aws_why::runner::run_user_command(&command, !json && !redact) {
@@ -426,9 +550,15 @@ fn run(
         return ExitCode::SUCCESS;
     }
 
-    let report = aws_why::analyze(&result, Duration::from_secs(diagnostic_timeout));
+    let mut report = aws_why::analyze(&result, Duration::from_secs(diagnostic_timeout));
     if !json && !redact && report.failure_kind != aws_why::model::FailureKind::Authorization {
         let _ = result.replay_stderr();
+    }
+    if !no_policy_validation {
+        aws_why::validate_candidate_policies(
+            &mut report,
+            policy_validation_timeout(diagnostic_timeout),
+        );
     }
     let report = if redact { report.redacted() } else { report };
     let write_result = if json {

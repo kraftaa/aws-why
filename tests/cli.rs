@@ -1,8 +1,9 @@
 #![cfg(unix)]
 
 use std::fs;
+use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 fn fake_aws() -> tempfile::TempDir {
     let directory = tempfile::tempdir().unwrap();
@@ -115,7 +116,7 @@ fn invoke_with_args(scenario: &str, json: bool, extra: &[&str]) -> Output {
     let directory = fake_aws();
     let aws = directory.path().join("aws");
     let mut command = Command::new(env!("CARGO_BIN_EXE_aws-why"));
-    command.arg("run");
+    command.arg("run").arg("--no-policy-validation");
     if json {
         command.arg("--json");
     }
@@ -138,6 +139,7 @@ fn invoke_verbose(scenario: &str) -> Output {
         .args([
             "run",
             "--verbose",
+            "--no-policy-validation",
             "--",
             aws.to_str().unwrap(),
             "s3",
@@ -154,7 +156,10 @@ fn invoke_redacted(scenario: &str, json: bool) -> Output {
     let directory = fake_aws();
     let aws = directory.path().join("aws");
     let mut command = Command::new(env!("CARGO_BIN_EXE_aws-why"));
-    command.arg("run").arg("--redact");
+    command
+        .arg("run")
+        .arg("--redact")
+        .arg("--no-policy-validation");
     if json {
         command.arg("--json");
     }
@@ -495,6 +500,70 @@ fn raw_encoded_authorization_payload_is_not_replayed() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("DENIED"));
     assert!(!stderr.contains("SUPERSECRETENCODEDPAYLOAD"));
+}
+
+#[test]
+fn explain_analyzes_a_saved_error_without_rerunning_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let error_path = directory.path().join("aws-error.txt");
+    fs::write(
+        &error_path,
+        "An error occurred (AccessDeniedException) when calling the ListKeys operation: User: arn:aws:sts::111111111111:assumed-role/DataEngineer/example-session is not authorized to perform: kms:ListKeys on resource: * because no identity-based policy allows the kms:ListKeys action\n",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_aws-why"))
+        .args(["explain", error_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("DENIED: kms:ListKeys on *"));
+    assert!(stdout.contains("SEND TO YOUR AWS ADMIN"));
+    assert!(stdout.contains("arn:aws:iam::111111111111:role/DataEngineer"));
+    assert!(!stdout.contains("Credential source"));
+}
+
+#[test]
+fn explain_reads_stdin_and_can_redact_json() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_aws-why"))
+        .args(["explain", "--json", "--redact", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"An error occurred (AccessDenied) when calling the GetObject operation: User: arn:aws:sts::111111111111:assumed-role/DataEngineer/example-session is not authorized to perform: s3:GetObject on resource: arn:aws:s3:::private-bucket/key because no identity-based policy allows the s3:GetObject action\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let text = String::from_utf8(output.stdout).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(value["identity"]["account_id"], "<account-id>");
+    assert_eq!(value["authorization"][0]["resource"], "<resource>");
+    assert!(!text.contains("111111111111"));
+    assert!(!text.contains("DataEngineer"));
+    assert!(!text.contains("private-bucket"));
+}
+
+#[test]
+fn explain_rejects_empty_input() {
+    let child = Command::new(env!("CARGO_BIN_EXE_aws-why"))
+        .args(["explain", "-"])
+        .stdin(Stdio::piped())
+        .output()
+        .unwrap();
+    assert_eq!(child.status.code(), Some(2));
+    assert!(
+        String::from_utf8(child.stderr)
+            .unwrap()
+            .contains("no error text")
+    );
 }
 
 #[test]
